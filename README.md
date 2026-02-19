@@ -16,24 +16,38 @@ TamaleBot is the open-source runtime that powers [tamalebot.com](https://tamaleb
 
 The closed-source parts (dashboard UI, orchestration, billing) never touch your data directly. They talk to this runtime via standard APIs.
 
-## Quick Start
+## Quickstart
 
 ```bash
-# Install
-npm install -g tamalebot
+# Clone the repo
+git clone https://github.com/SudoDog-official/tamalebot-oss.git
+cd tamalebot-oss
 
-# Initialize config
-tamalebot init
+# Install dependencies
+npm install
+
+# Build
+npm run build
 
 # Set your API key
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# Run a command with security policies applied
-tamalebot run python my_agent.py
+# Start an interactive AI agent
+tamalebot agent
 
-# Check what would be blocked (dry run)
-tamalebot run --dry-run "rm -rf /"
-# => BLOCKED: Command contains dangerous patterns: rm\s+-rf\s+/
+# Or run a command with security policies applied
+tamalebot run python my_agent.py
+```
+
+The interactive agent gives you a chat interface where the AI can browse the web, run shell commands, read/write files, and more — all policy-checked and audit-logged.
+
+```bash
+# Initialize a project config (optional)
+tamalebot init
+
+# Run as a Telegram bot
+export TELEGRAM_BOT_TOKEN=...
+tamalebot agent --telegram
 ```
 
 ## Security Engine
