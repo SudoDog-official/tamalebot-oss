@@ -5,7 +5,7 @@ import { writeFile, access } from "node:fs/promises";
 import chalk from "chalk";
 
 const DEFAULT_CONFIG = `# TamaleBot Agent Configuration
-# https://github.com/SudoDog-official/TamaleBot
+# https://github.com/SudoDog-official/tamalebot-oss
 
 agent:
   name: my-agent
