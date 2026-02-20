@@ -26,6 +26,8 @@ export interface PolicyConfig {
   blockedWritePaths: string[];
   dangerousCommandPatterns: string[];
   allowedDomains?: string[];
+  allowedSSHHosts?: string[];
+  allowedGitRepos?: string[];
   maxRequestsPerMinute?: number;
 }
 
@@ -88,6 +90,8 @@ export const DEFAULT_POLICY: PolicyConfig = {
 };
 
 export class PolicyEngine {
+  static readonly DEFAULT_CONFIG: PolicyConfig = DEFAULT_POLICY;
+
   private compiledPatterns: RegExp[];
   private config: PolicyConfig;
 
@@ -202,8 +206,59 @@ export class PolicyEngine {
     return { allowed: true };
   }
 
+  checkSSH(target: string): PolicyDecision {
+    if (!this.config.allowedSSHHosts || this.config.allowedSSHHosts.length === 0) {
+      return { allowed: true };
+    }
+
+    // target format: user@host:port
+    const hostMatch = target.match(/@([^:]+)/);
+    const host = hostMatch ? hostMatch[1] : target;
+
+    const isAllowed = this.config.allowedSSHHosts.some(
+      (allowed) => host === allowed || host.endsWith(`.${allowed}`)
+    );
+
+    if (!isAllowed) {
+      return {
+        allowed: false,
+        reason: `SSH to ${host} is not in the allowlist`,
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  checkGit(target: string): PolicyDecision {
+    if (!this.config.allowedGitRepos || this.config.allowedGitRepos.length === 0) {
+      return { allowed: true };
+    }
+
+    // target format: "action repo_or_path"
+    const parts = target.split(" ", 2);
+    const repoOrPath = parts[1] ?? "";
+
+    // Only check allowlist for remote operations
+    if (!repoOrPath.includes("://") && !repoOrPath.includes("@") && !repoOrPath.includes("github.com")) {
+      return { allowed: true };
+    }
+
+    const isAllowed = this.config.allowedGitRepos.some(
+      (allowed) => repoOrPath.includes(allowed)
+    );
+
+    if (!isAllowed) {
+      return {
+        allowed: false,
+        reason: `Git repo ${repoOrPath} is not in the allowlist`,
+      };
+    }
+
+    return { allowed: true };
+  }
+
   evaluate(
-    actionType: "file_read" | "file_write" | "command" | "http_request",
+    actionType: "file_read" | "file_write" | "command" | "http_request" | "vault" | "ssh_exec" | "git" | "schedule",
     target: string
   ): PolicyDecision {
     switch (actionType) {
@@ -215,6 +270,14 @@ export class PolicyEngine {
         return this.checkCommand(target);
       case "http_request":
         return this.checkDomain(target);
+      case "ssh_exec":
+        return this.checkSSH(target);
+      case "git":
+        return this.checkGit(target);
+      case "vault":
+      case "schedule":
+        // Vault and schedule operations are allowed by default
+        return { allowed: true };
       default:
         return { allowed: true };
     }

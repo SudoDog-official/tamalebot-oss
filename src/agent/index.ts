@@ -24,6 +24,7 @@ import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import { PolicyEngine } from "../security/policy-engine.js";
 import { AuditTrail } from "../security/audit-trail.js";
 import { SecretManager } from "../security/secret-manager.js";
+import { CredentialVault } from "../security/vault.js";
 import { LLMClient } from "./llm-client.js";
 import { runAgentLoop } from "./agent-loop.js";
 import type { ToolContext } from "./tools.js";
@@ -52,7 +53,19 @@ const isDocker = process.env.TAMALEBOT_DOCKER === "true" || mode === "http";
 const logDir = isDocker ? "/tmp/logs" : join(homedir(), ".tamalebot", "logs");
 const workDir = isDocker ? "/tmp/workspace" : process.cwd();
 
-const policy = new PolicyEngine();
+// Parse optional SSH/Git allowlists from env vars
+const allowedSSHHosts = process.env.TAMALEBOT_ALLOWED_SSH_HOSTS
+  ? process.env.TAMALEBOT_ALLOWED_SSH_HOSTS.split(",").map(h => h.trim()).filter(Boolean)
+  : undefined;
+const allowedGitRepos = process.env.TAMALEBOT_ALLOWED_GIT_REPOS
+  ? process.env.TAMALEBOT_ALLOWED_GIT_REPOS.split(",").map(r => r.trim()).filter(Boolean)
+  : undefined;
+
+const policy = new PolicyEngine({
+  ...PolicyEngine.DEFAULT_CONFIG,
+  ...(allowedSSHHosts ? { allowedSSHHosts } : {}),
+  ...(allowedGitRepos ? { allowedGitRepos } : {}),
+});
 const audit = new AuditTrail(logDir, agentId);
 const secrets = new SecretManager(audit);
 
@@ -201,6 +214,19 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
 
   // Per-chat conversation histories (in-memory + R2 persistence)
   const conversations = new ConversationManager(storage);
+
+  // Initialize credential vault (requires R2 storage)
+  let vault: CredentialVault | undefined;
+  if (storage) {
+    const vaultKey = process.env.TAMALEBOT_VAULT_KEY || process.env.TAMALEBOT_API_KEY || apiKey;
+    vault = new CredentialVault(storage, audit, agentId, vaultKey);
+    console.log("[tamalebot-agent] Credential vault enabled");
+  }
+
+  // Update tool context with vault and storage
+  toolContext.vault = vault;
+  toolContext.storage = storage ?? undefined;
+  toolContext.agentName = sanitizedName;
 
   // WhatsApp integration reference (needed by webhook routes)
   let whatsappIntegration: import("../integrations/whatsapp.js").WhatsAppIntegration | null = null;
@@ -366,6 +392,172 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
         } catch (err) {
           console.error(`[whatsapp] Webhook parse error: ${err instanceof Error ? err.message : err}`);
         }
+      }
+      return;
+    }
+
+    // --- Vault endpoints ---
+
+    // List vault credentials (metadata only)
+    if (path === "/vault" && req.method === "GET") {
+      if (!vault) { sendJson(res, 503, { error: "Vault not available" }); return; }
+      try {
+        const creds = await vault.list();
+        sendJson(res, 200, { credentials: creds });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Set a vault credential
+    if (path === "/vault" && req.method === "POST") {
+      if (!vault) { sendJson(res, 503, { error: "Vault not available" }); return; }
+      try {
+        const body = await parseBody(req);
+        const { name, value, type, description } = JSON.parse(body) as {
+          name?: string; value?: string; type?: string; description?: string;
+        };
+        if (!name || !value) { sendJson(res, 400, { error: "Missing name or value" }); return; }
+        await vault.set(name, value, {
+          type: (type || "generic") as import("../security/vault.js").CredentialType,
+          description,
+        });
+        sendJson(res, 200, { success: true, name });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Generate SSH key pair
+    if (path === "/vault/generate-ssh-key" && req.method === "POST") {
+      if (!vault) { sendJson(res, 503, { error: "Vault not available" }); return; }
+      try {
+        const body = await parseBody(req);
+        const { name } = JSON.parse(body) as { name?: string };
+        if (!name) { sendJson(res, 400, { error: "Missing key name" }); return; }
+        const publicKey = await vault.generateSSHKey(name);
+        sendJson(res, 200, { success: true, name, publicKey });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Delete a vault credential
+    const vaultDeleteMatch = path.match(/^\/vault\/([A-Z][A-Z0-9_]{1,63})$/);
+    if (vaultDeleteMatch && req.method === "DELETE") {
+      if (!vault) { sendJson(res, 503, { error: "Vault not available" }); return; }
+      try {
+        await vault.delete(vaultDeleteMatch[1]);
+        sendJson(res, 200, { success: true, name: vaultDeleteMatch[1] });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // --- Schedule endpoints ---
+
+    // List schedules
+    if (path === "/schedules" && req.method === "GET") {
+      if (!storage) { sendJson(res, 503, { error: "Storage not available" }); return; }
+      try {
+        const keys = await storage.list("schedules/");
+        const schedules = [];
+        for (const key of keys) {
+          try {
+            const fullKey = key.endsWith(".json") ? key : `schedules/${key}`;
+            const data = await storage.get(fullKey);
+            if (data) schedules.push(JSON.parse(data.toString("utf-8")));
+          } catch { /* skip */ }
+        }
+        sendJson(res, 200, { schedules });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Create schedule
+    if (path === "/schedules" && req.method === "POST") {
+      if (!storage) { sendJson(res, 503, { error: "Storage not available" }); return; }
+      try {
+        const body = await parseBody(req);
+        const { name, cron, task } = JSON.parse(body) as { name?: string; cron?: string; task?: string };
+        if (!name || !cron || !task) { sendJson(res, 400, { error: "Missing name, cron, or task" }); return; }
+        const { randomUUID } = await import("node:crypto");
+        const id = randomUUID().slice(0, 8);
+        const entry = {
+          id, name, cron, task,
+          agentName: sanitizedName,
+          enabled: true,
+          createdAt: new Date().toISOString(),
+          lastRun: null,
+          lastResult: null,
+        };
+        await storage.put(`schedules/${id}.json`, JSON.stringify(entry));
+        sendJson(res, 200, { success: true, schedule: entry });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Delete or update schedule
+    const scheduleMatch = path.match(/^\/schedules\/([a-f0-9-]+)$/);
+    if (scheduleMatch) {
+      const schedId = scheduleMatch[1];
+      if (req.method === "DELETE") {
+        if (!storage) { sendJson(res, 503, { error: "Storage not available" }); return; }
+        try {
+          await storage.delete(`schedules/${schedId}.json`);
+          sendJson(res, 200, { success: true, id: schedId });
+        } catch (err) {
+          sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+      if (req.method === "PATCH") {
+        if (!storage) { sendJson(res, 503, { error: "Storage not available" }); return; }
+        try {
+          const body = await parseBody(req);
+          const updates = JSON.parse(body) as { enabled?: boolean };
+          const data = await storage.get(`schedules/${schedId}.json`);
+          if (!data) { sendJson(res, 404, { error: "Schedule not found" }); return; }
+          const entry = JSON.parse(data.toString("utf-8"));
+          if (updates.enabled !== undefined) entry.enabled = updates.enabled;
+          await storage.put(`schedules/${schedId}.json`, JSON.stringify(entry));
+          sendJson(res, 200, { success: true, schedule: entry });
+        } catch (err) {
+          sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+    }
+
+    // Cron execution (called by Worker cron trigger)
+    if (path === "/cron/execute" && req.method === "POST") {
+      try {
+        const body = await parseBody(req);
+        const { scheduleId, task } = JSON.parse(body) as { scheduleId?: string; task?: string };
+        if (!task) { sendJson(res, 400, { error: "Missing task" }); return; }
+        console.log(`[cron] Executing schedule ${scheduleId}: ${task.slice(0, 80)}`);
+        const history: MessageParam[] = [];
+        const response = await runAgentLoop(task, history, {
+          llm,
+          toolContext,
+          onToolCall(name, input) {
+            console.log(`  [cron-tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
+          },
+          onToolResult(name, output, isError) {
+            if (isError) console.log(`  [cron-tool] ${name}: ERROR - ${output.slice(0, 200)}`);
+          },
+        });
+        sendJson(res, 200, { scheduleId, result: response.text, stats: { toolCalls: response.toolCallCount } });
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
       }
       return;
     }
