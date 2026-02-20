@@ -6,13 +6,13 @@
  *
  * This is the process that runs inside each agent's Docker container
  * (or locally via `tamalebot run`). It:
- * 1. Connects to the LLM API (Anthropic, OpenAI, Kimi, Gemini, MiniMax)
+ * 1. Connects to the Claude API
  * 2. Accepts messages (via HTTP in container mode, or stdin in standalone mode)
  * 3. Runs the tool-use loop with security policy enforcement
  * 4. Returns responses
  *
  * Modes:
- *   TAMALEBOT_MODE=http   → HTTP server (for Docker / cloud containers)
+ *   TAMALEBOT_MODE=http   → HTTP server (for Cloudflare Containers)
  *   TAMALEBOT_MODE=repl   → Interactive stdin REPL (default)
  */
 
@@ -27,6 +27,7 @@ import { SecretManager } from "../security/secret-manager.js";
 import { LLMClient } from "./llm-client.js";
 import { runAgentLoop } from "./agent-loop.js";
 import type { ToolContext } from "./tools.js";
+import type { StorageBackend } from "../storage/index.js";
 
 const agentId = process.env.TAMALEBOT_AGENT_ID ?? "standalone";
 const policyName = process.env.TAMALEBOT_POLICY ?? "default";
@@ -67,6 +68,100 @@ Guidelines:
 - If you're unsure about something, say so rather than guessing`;
 }
 
+// --- Conversation Manager (in-memory + optional R2 persistence) ---
+
+class ConversationManager {
+  private cache = new Map<string, MessageParam[]>();
+  private dirty = new Set<string>();
+  private storage: StorageBackend | null;
+
+  constructor(storage: StorageBackend | null) {
+    this.storage = storage;
+  }
+
+  async get(chatId: string): Promise<MessageParam[]> {
+    if (this.cache.has(chatId)) {
+      return this.cache.get(chatId)!;
+    }
+
+    // Lazy-load from R2
+    if (this.storage) {
+      try {
+        const data = await this.storage.get(`conversations/${chatId}.json`);
+        if (data) {
+          const history = JSON.parse(data.toString("utf-8")) as MessageParam[];
+          this.cache.set(chatId, history);
+          return history;
+        }
+      } catch (err) {
+        console.error(`[memory] Failed to load ${chatId}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    const history: MessageParam[] = [];
+    this.cache.set(chatId, history);
+    return history;
+  }
+
+  markDirty(chatId: string): void {
+    this.dirty.add(chatId);
+  }
+
+  async flush(): Promise<void> {
+    if (!this.storage || this.dirty.size === 0) return;
+
+    const promises: Promise<void>[] = [];
+    for (const chatId of this.dirty) {
+      const history = this.cache.get(chatId);
+      if (history) {
+        promises.push(
+          this.storage.put(
+            `conversations/${chatId}.json`,
+            JSON.stringify(history)
+          ).catch((err) => {
+            console.error(`[memory] Failed to save ${chatId}: ${err instanceof Error ? err.message : err}`);
+          }) as Promise<void>
+        );
+      }
+    }
+    await Promise.all(promises);
+    this.dirty.clear();
+  }
+
+  delete(chatId: string): void {
+    this.cache.delete(chatId);
+    this.dirty.delete(chatId);
+    if (this.storage) {
+      this.storage.delete(`conversations/${chatId}.json`).catch(() => {});
+    }
+  }
+
+  clear(): void {
+    // Clear in-memory
+    const keys = [...this.cache.keys()];
+    this.cache.clear();
+    this.dirty.clear();
+    // Clear R2
+    if (this.storage) {
+      for (const key of keys) {
+        this.storage.delete(`conversations/${key}.json`).catch(() => {});
+      }
+    }
+  }
+
+  get size(): number {
+    return this.cache.size;
+  }
+
+  totalMessages(): number {
+    let total = 0;
+    for (const history of this.cache.values()) {
+      total += history.length;
+    }
+    return total;
+  }
+}
+
 // --- HTTP Server Mode ---
 
 function parseBody(req: IncomingMessage): Promise<string> {
@@ -93,8 +188,22 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
   const port = Number(process.env.PORT) || 8080;
   const startTime = Date.now();
 
-  // Per-chat conversation histories (in-memory)
-  const conversations = new Map<string, MessageParam[]>();
+  // Initialize storage backend (R2 if worker URL available, otherwise in-memory only)
+  const workerUrl = process.env.TAMALEBOT_WORKER_URL;
+  const sanitizedName = (process.env.TAMALEBOT_AGENT_NAME ?? "agent")
+    .toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
+  let storage: StorageBackend | null = null;
+  if (workerUrl) {
+    const { R2Storage } = await import("../storage/r2.js");
+    storage = new R2Storage(workerUrl, sanitizedName);
+    console.log("[tamalebot-agent] R2 persistent memory enabled");
+  }
+
+  // Per-chat conversation histories (in-memory + R2 persistence)
+  const conversations = new ConversationManager(storage);
+
+  // WhatsApp integration reference (needed by webhook routes)
+  let whatsappIntegration: import("../integrations/whatsapp.js").WhatsAppIntegration | null = null;
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
@@ -135,11 +244,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
         }
 
         const conversationKey = chatId ?? "default";
-        let history = conversations.get(conversationKey);
-        if (!history) {
-          history = [];
-          conversations.set(conversationKey, history);
-        }
+        const history = await conversations.get(conversationKey);
 
         const response = await runAgentLoop(text, history, {
           llm,
@@ -153,6 +258,10 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
             }
           },
         });
+
+        // Persist conversation to R2
+        conversations.markDirty(conversationKey);
+        await conversations.flush();
 
         sendJson(res, 200, {
           text: response.text,
@@ -209,6 +318,58 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
       return;
     }
 
+    // Memory stats
+    if (path === "/memory/stats" && req.method === "GET") {
+      sendJson(res, 200, {
+        conversationCount: conversations.size,
+        totalMessages: conversations.totalMessages(),
+      });
+      return;
+    }
+
+    // Clear all memory
+    if (path === "/memory/clear" && req.method === "POST") {
+      conversations.clear();
+      sendJson(res, 200, { cleared: true });
+      return;
+    }
+
+    // WhatsApp webhook verification (GET)
+    if (path === "/webhook/whatsapp" && req.method === "GET") {
+      if (whatsappIntegration) {
+        const result = whatsappIntegration.handleVerify(url.searchParams);
+        res.writeHead(result.status, {
+          "Content-Type": "text/plain",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(result.body);
+      } else {
+        sendJson(res, 404, { error: "WhatsApp integration not configured" });
+      }
+      return;
+    }
+
+    // WhatsApp webhook incoming messages (POST)
+    if (path === "/webhook/whatsapp" && req.method === "POST") {
+      // Read body first, then ACK immediately (Meta requires <5s)
+      const body = await parseBody(req);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("OK");
+
+      if (whatsappIntegration) {
+        try {
+          const payload = JSON.parse(body) as Record<string, unknown>;
+          // Process async — don't await
+          whatsappIntegration.handleWebhook(payload).catch((err) => {
+            console.error(`[whatsapp] Async webhook error: ${err instanceof Error ? err.message : err}`);
+          });
+        } catch (err) {
+          console.error(`[whatsapp] Webhook parse error: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      return;
+    }
+
     sendJson(res, 404, { error: "Not found" });
   });
 
@@ -216,7 +377,9 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
     console.log(`[tamalebot-agent] HTTP server listening on :${port}`);
   });
 
-  // Also start Telegram if configured
+  // --- Start Integrations ---
+
+  // Telegram (long-polling)
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
   if (telegramToken) {
     const { TelegramIntegration } = await import("../integrations/telegram.js");
@@ -227,6 +390,36 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext): Promis
     });
     await telegram.connect();
     console.log("[tamalebot-agent] Telegram integration started");
+  }
+
+  // Discord (WebSocket Gateway)
+  const discordToken = process.env.DISCORD_BOT_TOKEN;
+  if (discordToken) {
+    const { DiscordIntegration } = await import("../integrations/discord.js");
+    const discord = new DiscordIntegration({
+      botToken: discordToken,
+      llm,
+      toolContext,
+    });
+    await discord.connect();
+    console.log("[tamalebot-agent] Discord integration started");
+  }
+
+  // WhatsApp (webhook-based — routes handled above)
+  const whatsappToken = process.env.WHATSAPP_TOKEN;
+  const whatsappPhoneId = process.env.WHATSAPP_PHONE_ID;
+  const whatsappVerifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+  if (whatsappToken && whatsappPhoneId && whatsappVerifyToken) {
+    const { WhatsAppIntegration } = await import("../integrations/whatsapp.js");
+    whatsappIntegration = new WhatsAppIntegration({
+      accessToken: whatsappToken,
+      phoneNumberId: whatsappPhoneId,
+      verifyToken: whatsappVerifyToken,
+      llm,
+      toolContext,
+    });
+    await whatsappIntegration.connect();
+    console.log("[tamalebot-agent] WhatsApp integration started");
   }
 
   // Graceful shutdown

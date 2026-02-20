@@ -7,10 +7,9 @@
  * Each integration connects the agent to an external service.
  * Integrations are open source so the community can add more.
  *
- * Phase 1: Telegram, Web browsing (via tools)
+ * Phase 1: Telegram, Discord, WhatsApp, Web browsing (via tools)
  * Phase 2: Email (Gmail), Slack, Calendar
- * Phase 3: Discord, WhatsApp
- * Phase 4: iMessage (via relay)
+ * Phase 3: iMessage (via relay)
  */
 
 export interface Integration {
@@ -21,3 +20,5 @@ export interface Integration {
 }
 
 export { TelegramIntegration } from "./telegram.js";
+export { DiscordIntegration } from "./discord.js";
+export { WhatsAppIntegration } from "./whatsapp.js";

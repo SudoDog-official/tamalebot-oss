@@ -15,6 +15,8 @@
  *   - Local filesystem (development)
  *
  * All backends speak S3-compatible API, making migration trivial.
+ *
+ * See also: R2Storage in ./r2.ts for Cloudflare R2 via Worker HTTP
  */
 
 export interface StorageBackend {
