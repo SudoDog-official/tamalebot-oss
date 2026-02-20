@@ -5,11 +5,12 @@ services:
       dockerfile: docker/Dockerfile
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      - "8080:8080"
     env_file:
       - ../.env
-    volumes:
-      - agent-data:/app/data
+    environment:
+      - TAMALEBOT_MODE=http
+      - PORT=8080
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -17,6 +18,3 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=100M
-
-volumes:
-  agent-data:
