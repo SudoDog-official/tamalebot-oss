@@ -1,20 +1,40 @@
 {
-  "name": "tamalebot-security",
+  "name": "tamalebot",
   "version": "0.2.0",
-  "description": "Open-source security engine for TamaleBot AI agents. Policy enforcement, audit trails, encrypted vault.",
+  "description": "Open-source AI agent runtime. Policy enforcement, audit trails, 5 integrations, multi-provider LLM support.",
   "type": "module",
   "license": "Apache-2.0",
+  "bin": {
+    "tamalebot": "./dist/cli/index.js"
+  },
   "scripts": {
     "build": "tsc",
+    "dev": "tsx watch src/cli/index.ts",
+    "start": "node dist/cli/index.js",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "docker:build": "docker build -t tamalebot-agent -f docker/Dockerfile .",
+    "docker:run": "docker run --rm -it tamalebot-agent"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.77.0",
+    "@slack/bolt": "^4.6.0",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7",
+    "imapflow": "^1.2.10",
+    "mailparser": "^3.9.3",
+    "nodemailer": "^8.0.1",
+    "openai": "^6.22.0",
     "pino": "^9.6.0",
+    "yaml": "^2.7.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/mailparser": "^3.4.6",
     "@types/node": "^22.13.4",
+    "@types/nodemailer": "^7.0.11",
     "tsx": "^4.19.3",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
