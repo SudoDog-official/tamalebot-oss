@@ -1,0 +1,61 @@
+# TamaleBot Default Security Policy
+# This policy is applied when no custom policy is specified.
+# All policies are open source so users can audit exactly what is blocked.
+
+name: default
+
+blocked_read_paths:
+  - /etc/shadow
+  - /etc/passwd
+  - /etc/sudoers
+  - ~/.ssh/id_rsa
+  - ~/.ssh/id_ed25519
+  - ~/.aws/credentials
+  - ~/.config/gcloud/
+  - .env
+  - .env.local
+  - .env.production
+  - ~/.docker/config.json
+  - ~/.kube/config
+
+blocked_write_paths:
+  - /etc/
+  - /usr/bin/
+  - /usr/sbin/
+  - /bin/
+  - /sbin/
+  - /boot/
+  - /sys/
+  - /proc/
+
+dangerous_command_patterns:
+  # Database destruction
+  - 'DROP\s+TABLE'
+  - 'DROP\s+DATABASE'
+  - 'TRUNCATE\s+TABLE'
+  - 'DELETE\s+FROM\s+\w+\s*;?\s*$'
+
+  # Filesystem destruction
+  - 'rm\s+-rf\s+/'
+  - 'rm\s+-rf\s+\*'
+  - 'sudo\s+rm'
+  - 'chmod\s+777'
+
+  # System operations
+  - 'mkfs\.'
+  - 'dd\s+if='
+
+  # Data exfiltration
+  - 'curl.*pastebin'
+  - 'wget.*pastebin'
+  - 'curl.*ngrok'
+  - 'curl.*requestbin'
+
+# Uncomment to restrict outbound HTTP to specific domains:
+# allowed_domains:
+#   - api.anthropic.com
+#   - api.openai.com
+#   - generativelanguage.googleapis.com
+
+# Rate limiting
+# max_requests_per_minute: 60

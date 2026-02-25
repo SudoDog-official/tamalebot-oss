@@ -1,0 +1,25 @@
+{
+  "name": "tamalebot-security",
+  "version": "0.2.0",
+  "description": "Open-source security engine for TamaleBot AI agents. Policy enforcement, audit trails, encrypted vault.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "pino": "^9.6.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
