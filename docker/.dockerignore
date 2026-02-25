@@ -1,0 +1,11 @@
+node_modules
+src
+tests
+landing
+worker
+.git
+.github
+.env*
+*.md
+.claude
+.vscode

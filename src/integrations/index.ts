@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 TamaleBot Contributors
+
+/**
+ * Integration Layer
+ *
+ * Each integration connects the agent to an external service.
+ * Integrations are open source so the community can add more.
+ *
+ * Phase 1: Telegram, Discord, WhatsApp, Web browsing (via tools)
+ * Phase 2: Slack, Email (IMAP/SMTP), Calendar
+ * Phase 3: iMessage (via relay)
+ */
+
+export interface Integration {
+  name: string;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  isConnected(): boolean;
+}
+
+export { TelegramIntegration } from "./telegram.js";
+export { DiscordIntegration } from "./discord.js";
+export { WhatsAppIntegration } from "./whatsapp.js";
+export { SlackIntegration } from "./slack.js";
+export { EmailIntegration } from "./email.js";

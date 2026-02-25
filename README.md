@@ -1,57 +1,78 @@
-# TamaleBot Security Engine
+# TamaleBot
 
-Open-source security engine for [TamaleBot](https://tamalebot.com) AI agents. Policy enforcement, audit trails, and encrypted credential vault.
+Open-source AI agent runtime. Every tool call checked. Every action logged. Every agent isolated.
 
-## What This Is
+Deploy autonomous AI agents that can run shell commands, read/write files, browse the web, and connect to Telegram, Discord, WhatsApp, Slack, and email — all with security policy enforcement, audit trails, and encrypted credential storage.
 
-This repo contains TamaleBot's **security-critical code** — the parts you need to audit and trust. Every component that gates agent actions, logs decisions, or handles credentials is here under Apache 2.0.
+## Quickstart
 
-- **Policy engine** — intercepts every tool call before execution. Blocks destructive commands, sensitive file access, data exfiltration, and encoding obfuscation attacks.
-- **Audit trail** — append-only, cryptographically signed log of every action and decision.
-- **Credential vault** — AES-256-GCM encrypted per-agent storage for API keys, SSH keys, and tokens.
-- **Secret manager** — injects credentials at runtime, masks them from logs. Never written to disk.
+```bash
+git clone https://github.com/SudoDog-official/tamalebot-oss.git
+cd tamalebot-oss
+npm install
+npm run build
 
-The agent runtime, integrations, and orchestration layer are distributed as a Docker image and managed via [tamalebot.com](https://tamalebot.com). This repo is what lets you verify the security claims yourself.
+# Run interactively
+TAMALEBOT_API_KEY=sk-ant-... npx tamalebot agent
 
-## Why Open Source
+# Or via Docker
+docker compose -f docker/docker-compose.yml up
+```
 
-This code gates your agent's commands, handles your API keys, and logs your actions. If you can't read it, you can't trust it. A closed-source security tool is indistinguishable from malware.
+Set `TAMALEBOT_PROVIDER` to `anthropic`, `openai`, `moonshot`, `google`, or `minimax` and provide the matching API key. Defaults to Anthropic Claude.
 
-**What's open (this repo):** Everything that enforces security policy, logs decisions, or touches credentials.
+## What's Included
 
-**What's not here:** Agent runtime, messaging integrations, CLI, MCP server, dashboard. These are distributed as a Docker image — you can self-host it anywhere, but the source is proprietary.
+| Component | Description |
+|-----------|-------------|
+| **Agent Runtime** | Think/act loop: LLM reasons, calls tools, gets results, repeats |
+| **Security Engine** | Policy enforcement on every tool call — blocks destructive commands, sensitive file access, data exfiltration |
+| **Audit Trail** | Append-only, signed log of every action and decision |
+| **Credential Vault** | AES-256-GCM encrypted per-agent storage for API keys, SSH keys, tokens |
+| **5 Integrations** | Telegram, Discord, WhatsApp, Slack, Email (IMAP/SMTP) |
+| **4 Core Tools** | Shell commands, file read/write, web browsing |
+| **Model Router** | Routes simple queries to cheap models, complex tasks to capable models — saves 40-70% on API costs |
+| **Agent Skills** | Modular skill system via SKILL.md files |
+| **CLI** | `tamalebot agent`, `tamalebot run`, `tamalebot init` |
+| **Docker** | Hardened container: non-root, no privileges, read-only filesystem |
 
-**No lock-in:** The Docker image runs on Cloudflare, AWS, or your own hardware. The open security engine means you can verify exactly what's being enforced.
+## Architecture
 
-## Security Engine
+```
+User Message
+     |
+     v
++--------------------+     +------------------+
+| Agent Runtime      |---->| LLM Provider     |
+| (think/act loop)   |<----| (Claude, GPT,    |
+|                    |     |  Gemini, etc.)    |
+| 1. Send to LLM    |     +------------------+
+| 2. LLM picks tool |
+| 3. Policy check   |---->+------------------+
+| 4. Execute tool    |     | Security Engine  |
+| 5. Return result   |     | - Policy check   |
+| 6. Repeat          |     | - Audit log      |
++--------------------+     | - Credential mgr |
+     |                     +------------------+
+     v
++--------------------+
+| Integrations       |
+| Telegram, Discord, |
+| WhatsApp, Slack,   |
+| Email              |
++--------------------+
+```
+
+## Security
 
 Every tool call passes through the policy engine before execution:
-
-```
-Agent wants to run: rm -rf /tmp/workspace
-                    |
-                    v
-          +-------------------+
-          | Policy Engine     |
-          |                   |
-          | 1. Check command  | --> dangerous pattern?
-          | 2. Check paths    | --> sensitive file/directory?
-          | 3. Check domain   | --> allowed outbound host?
-          | 4. Encoding check | --> Base64/hex obfuscation?
-          | 5. Rate limit     | --> within budget?
-          | 6. Log decision   | --> audit trail entry
-          +-------------------+
-                    |
-                    v
-            ALLOWED or BLOCKED
-```
 
 **Blocked by default:**
 - Destructive commands: `rm -rf /`, `DROP TABLE`, `chmod 777`, fork bombs
 - Sensitive file reads: `~/.ssh/id_rsa`, `~/.aws/credentials`, `.env`
 - System directory writes: `/etc/`, `/usr/bin/`, `/boot/`
 - Data exfiltration: `curl pastebin`, `wget ngrok`, `nc` to external IPs
-- Encoding obfuscation: `base64 -d | sh`, hex decode pipelines, Unicode homoglyph domains
+- Encoding obfuscation: `base64 -d | sh`, hex decode pipelines
 
 **5 Hardening Layers** (all enabled by default):
 
@@ -61,65 +82,96 @@ Agent wants to run: rm -rf /tmp/workspace
 | Block Data Exfiltration | Blocks shell commands sending workspace data externally |
 | Default-Deny Outbound | Only allows HTTP to approved domain list |
 | System Prompt Protection | Injects anti-injection instructions |
-| Vault Access Protection | Blocks credential retrieval after browsing untrusted web content |
+| Vault Access Protection | Blocks credential retrieval after browsing untrusted content |
+
+## Integrations
+
+Each integration connects to a messaging platform and forwards messages through the agent loop:
+
+```bash
+# Telegram
+TELEGRAM_BOT_TOKEN=... npx tamalebot agent
+
+# Discord
+DISCORD_BOT_TOKEN=... npx tamalebot agent
+
+# Slack (Socket Mode — no public URL needed)
+SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... npx tamalebot agent
+
+# Email (IMAP IDLE + SMTP)
+EMAIL_IMAP_HOST=... EMAIL_IMAP_USER=... EMAIL_IMAP_PASS=... npx tamalebot agent
+```
+
+WhatsApp requires a publicly accessible webhook URL — see `src/integrations/whatsapp.ts` for setup.
+
+## Configuration
+
+Environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TAMALEBOT_API_KEY` | LLM provider API key | (required) |
+| `TAMALEBOT_PROVIDER` | `anthropic`, `openai`, `moonshot`, `google`, `minimax` | `anthropic` |
+| `TAMALEBOT_MODEL` | Model name | Provider default |
+| `TAMALEBOT_POLICY` | Security policy name | `default` |
+| `TAMALEBOT_SYSTEM_PROMPT` | Custom system prompt | (none) |
+| `TAMALEBOT_MODE` | `repl` or `http` | `repl` |
+| `TAMALEBOT_ROUTER_MODEL` | Cheap model for routing (enables cost optimization) | (disabled) |
+| `TAMALEBOT_STORAGE_PATH` | Local persistent storage path | `/tmp/workspace/.tamalebot-data` |
+
+See `.env.example` for the full list including integration tokens.
 
 ## Project Structure
 
 ```
 src/
+  agent/
+    agent-loop.ts         # Core think/act cycle
+    llm-client.ts         # Multi-provider LLM client
+    tools.ts              # Tool schemas + executors (shell, file, web)
+    model-router.ts       # Cost-optimization routing
+    context-compressor.ts # Token-saving history compression
+    skill-loader.ts       # Agent Skills discovery
+    index.ts              # HTTP server + REPL runtime
   security/
-    policy-engine.ts    # Central policy: blocked patterns, allowlists, rate limits
-    audit-trail.ts      # Append-only JSONL logging with signing
-    vault.ts            # AES-256-GCM encrypted per-agent credential storage
-    secret-manager.ts   # Credential injection and masking
-    index.ts            # Exports
-skills-spec/
-  SKILL-FORMAT.md       # Agent Skills format specification (Anthropic open standard)
-docker/
-  Dockerfile            # Agent container image (hardened, non-root)
+    policy-engine.ts      # YAML-based policy enforcement
+    audit-trail.ts        # Append-only signed logging
+    vault.ts              # AES-256-GCM credential storage
+    secret-manager.ts     # Credential injection + masking
+  integrations/
+    telegram.ts           # Telegram Bot API (long polling)
+    discord.ts            # Discord WebSocket (discord.js)
+    whatsapp.ts           # WhatsApp Cloud API (webhooks)
+    slack.ts              # Slack Socket Mode (@slack/bolt)
+    email.ts              # IMAP IDLE + SMTP
+  storage/
+    index.ts              # Storage interface + local filesystem backend
+  cli/
+    index.ts              # CLI entry point
+    commands/             # agent, run, init, status
+  skills/                 # Built-in agent skills (SKILL.md format)
 config/
-  default-policy.yaml   # Default security policy
-tests/
-  security/             # Policy engine and secret manager tests
+  default-policy.yaml     # Default security policy
+docker/
+  Dockerfile              # Hardened production container
+  docker-compose.yml      # Local development setup
+tests/                    # Full test suite
 ```
-
-## Agent Skills Format
-
-TamaleBot supports modular agent skills using `SKILL.md` files (Anthropic open standard). See [skills-spec/SKILL-FORMAT.md](./skills-spec/SKILL-FORMAT.md) for the format specification. Community-contributed skills are welcome.
-
-## Docker
-
-Each agent runs in a hardened container:
-
-```bash
-docker build -t tamalebot-agent -f docker/Dockerfile .
-docker run --rm -it \
-  --security-opt no-new-privileges:true \
-  --cap-drop ALL \
-  --read-only \
-  --tmpfs /tmp:size=100M \
-  tamalebot-agent
-```
-
-Container hardening: non-root user, no privilege escalation, all capabilities dropped, read-only filesystem.
 
 ## Development
 
 ```bash
 npm install
-npm test          # Run security engine tests
+npm test          # Run all tests
 npm run build     # Compile TypeScript
+npm run dev       # Run in development mode
 ```
 
 Requires Node.js >= 22.
 
-## Using with TamaleBot
+## Cloud Hosting
 
-This security engine is built into every TamaleBot agent. To deploy agents:
-
-1. **Cloud (managed):** [tamalebot.com](https://tamalebot.com) — deploy in 60 seconds, $5/mo base
-2. **Self-hosted:** Pull the Docker image and run on your own infrastructure
-3. **Claude integration:** Install [@tamalebot/mcp-server](https://www.npmjs.com/package/@tamalebot/mcp-server) to manage agents from Claude Desktop
+Don't want to self-host? [tamalebot.com](https://tamalebot.com) runs your agents on Cloudflare's global network with a dashboard, one-click deploy, scheduled tasks, and MCP integration — $5/mo base.
 
 ## License
 
