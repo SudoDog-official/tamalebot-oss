@@ -343,7 +343,7 @@ export class PolicyEngine {
   }
 
   evaluate(
-    actionType: "file_read" | "file_write" | "command" | "http_request" | "vault" | "ssh_exec" | "git" | "schedule" | "sub_agent",
+    actionType: "file_read" | "file_write" | "command" | "http_request" | "vault" | "ssh_exec" | "git" | "schedule" | "sub_agent" | "message_agent" | "team_storage" | "list_agents" | "google_gmail_search" | "google_gmail_read" | "google_gmail_send" | "google_drive_list" | "google_drive_read" | "google_drive_upload" | "google_docs_read" | "google_sheets_read" | "google_sheets_append" | "google_calendar_list" | "google_calendar_create",
     target: string
   ): PolicyDecision {
     switch (actionType) {

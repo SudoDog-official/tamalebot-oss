@@ -20,6 +20,8 @@ import type { PolicyEngine, PolicyDecision } from "../security/policy-engine.js"
 import type { AuditTrail } from "../security/audit-trail.js";
 import type { CredentialVault } from "../security/vault.js";
 import type { StorageBackend } from "../storage/index.js";
+import type { GoogleAuth } from "./google-auth.js";
+import { GOOGLE_TOOL_SCHEMAS, executeGoogleTool } from "./google-tools.js";
 
 export interface ToolResult {
   output: string;
@@ -41,6 +43,13 @@ export interface ToolContext {
   workerUrl?: string;
   parentAgentName?: string;
   subAgentsEnabled?: boolean;
+  // Multi-agent collaboration
+  agentMessagingEnabled?: boolean;
+  teamStorageEnabled?: boolean;
+  // Owner token for authenticated Worker API calls
+  ownerToken?: string;
+  // Google Workspace integration
+  googleAuth?: GoogleAuth;
 }
 
 /**
@@ -264,41 +273,166 @@ export const TOOL_SCHEMAS: Tool[] = [
       required: ["action"],
     },
   },
-  {
-    name: "sub_agent",
-    description:
-      "Spawn a temporary sub-agent to handle a specific task. The sub-agent runs " +
-      "independently, completes the task, and returns the result. Use this to " +
-      "delegate research, analysis, or subtasks while you continue working. " +
-      "Sub-agents have the same tools as you but run in a separate context.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        task: {
-          type: "string",
-          description: "The task instruction to send to the sub-agent",
-        },
-        name: {
-          type: "string",
-          description: "Optional name for the sub-agent (auto-generated if omitted)",
-        },
-        systemPrompt: {
-          type: "string",
-          description: "Optional system prompt override for the sub-agent",
-        },
-        model: {
-          type: "string",
-          description: "Optional model override (e.g. 'claude-haiku-3-5-20241022' for cheaper tasks)",
-        },
-        timeout_ms: {
-          type: "number",
-          description: "Timeout in milliseconds (default: 120000, max: 300000)",
+];
+
+// --- Conditional tool schemas (gated by entitlements) ---
+
+const SUB_AGENT_SCHEMA: Tool = {
+  name: "sub_agent",
+  description:
+    "Spawn temporary sub-agents to handle specific tasks. Can run a single task " +
+    "or multiple tasks in parallel. Sub-agents run independently in separate " +
+    "containers, complete their tasks, and return results. Use this to delegate " +
+    "research, analysis, coding, or any subtask.\n\n" +
+    "Single task: provide 'task' string.\n" +
+    "Parallel tasks: provide 'tasks' array — all run concurrently, results returned together.\n" +
+    "Role: give the sub-agent a persona (e.g. 'researcher', 'editor') to specialize its behavior.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      task: {
+        type: "string",
+        description: "Single task instruction for one sub-agent",
+      },
+      tasks: {
+        type: "array",
+        description: "Multiple tasks to run in parallel. Each gets its own sub-agent container.",
+        items: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "Task instruction" },
+            role: { type: "string", description: "Role/persona for this sub-agent (e.g. 'researcher', 'editor')" },
+            model: { type: "string", description: "Optional model override for this sub-agent" },
+          },
+          required: ["task"],
         },
       },
-      required: ["task"],
+      name: {
+        type: "string",
+        description: "Optional name for the sub-agent (auto-generated if omitted)",
+      },
+      role: {
+        type: "string",
+        description: "Role/persona for the sub-agent (e.g. 'researcher', 'code reviewer'). Shapes the sub-agent's system prompt.",
+      },
+      systemPrompt: {
+        type: "string",
+        description: "Optional full system prompt override for the sub-agent",
+      },
+      model: {
+        type: "string",
+        description: "Optional model override (e.g. 'claude-haiku-4-5-20251001' for cheaper tasks)",
+      },
+      timeout_ms: {
+        type: "number",
+        description: "Timeout in milliseconds (default: 120000, max: 300000)",
+      },
     },
   },
-];
+};
+
+const MESSAGE_AGENT_SCHEMA: Tool = {
+  name: "message_agent",
+  description:
+    "Send a message to another agent in your team (same account) and get their " +
+    "response. Use this to collaborate with sibling agents — ask them to perform " +
+    "tasks, review work, or share information. The target agent must be deployed " +
+    "and running.\n\n" +
+    "Example: message_agent({agent: 'researcher', message: 'Find the top 5 competitors'})",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      agent: {
+        type: "string",
+        description: "Name of the target agent to message",
+      },
+      message: {
+        type: "string",
+        description: "The message to send to the target agent",
+      },
+      chatId: {
+        type: "string",
+        description: "Optional conversation thread ID. Defaults to 'agent-msg-{your-name}' for separate conversation context.",
+      },
+      timeout_ms: {
+        type: "number",
+        description: "Timeout in milliseconds (default: 120000, max: 300000)",
+      },
+    },
+    required: ["agent", "message"],
+  },
+};
+
+const TEAM_STORAGE_SCHEMA: Tool = {
+  name: "team_storage",
+  description:
+    "Read, write, list, or delete files in shared team storage. All agents in your " +
+    "team (same account) can access this storage, enabling collaboration.\n\n" +
+    "Use this to share task lists, documents, status updates, reviews, and any data " +
+    "between agents. Recommended: store JSON for structured data.\n\n" +
+    "Patterns:\n" +
+    "- Tasks: team_storage({action:'put', key:'tasks/write-blog.json', data:'{...}'})\n" +
+    "- Status: team_storage({action:'put', key:'status/my-name.json', data:'{...}'})\n" +
+    "- Review: team_storage({action:'get', key:'tasks/write-blog.json'})",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["get", "put", "delete", "list"],
+        description: "Operation to perform",
+      },
+      key: {
+        type: "string",
+        description: "Storage key (path-like). Required for get, put, delete.",
+      },
+      data: {
+        type: "string",
+        description: "Data to store (for put action). JSON strings recommended.",
+      },
+      prefix: {
+        type: "string",
+        description: "Prefix filter for list action (e.g. 'tasks/' to list all tasks)",
+      },
+    },
+    required: ["action"],
+  },
+};
+
+const LIST_AGENTS_SCHEMA: Tool = {
+  name: "list_agents",
+  description:
+    "Discover other agents in your team (same account). Returns each agent's name, " +
+    "model, and system prompt summary. Use this to understand who to delegate tasks " +
+    "to or collaborate with via message_agent.",
+  input_schema: {
+    type: "object" as const,
+    properties: {},
+  },
+};
+
+/**
+ * Get tool schemas based on agent's entitlements.
+ * Only shows tools the agent is allowed to use.
+ */
+export function getToolSchemas(ctx: ToolContext): Tool[] {
+  const tools = [...TOOL_SCHEMAS];
+
+  if (ctx.subAgentsEnabled) {
+    tools.push(SUB_AGENT_SCHEMA);
+  }
+  if (ctx.agentMessagingEnabled) {
+    tools.push(MESSAGE_AGENT_SCHEMA, LIST_AGENTS_SCHEMA);
+  }
+  if (ctx.teamStorageEnabled) {
+    tools.push(TEAM_STORAGE_SCHEMA);
+  }
+  if (ctx.googleAuth) {
+    tools.push(...GOOGLE_TOOL_SCHEMAS);
+  }
+
+  return tools;
+}
 
 /**
  * Execute a tool call after policy checks.
@@ -327,6 +461,24 @@ export async function executeTool(
       return executeSchedule(input, ctx);
     case "sub_agent":
       return executeSubAgent(input, ctx);
+    case "message_agent":
+      return executeMessageAgent(input, ctx);
+    case "team_storage":
+      return executeTeamStorage(input, ctx);
+    case "list_agents":
+      return executeListAgents(input, ctx);
+    case "google_gmail_search":
+    case "google_gmail_read":
+    case "google_gmail_send":
+    case "google_drive_list":
+    case "google_drive_read":
+    case "google_drive_upload":
+    case "google_docs_read":
+    case "google_sheets_read":
+    case "google_sheets_append":
+    case "google_calendar_list":
+    case "google_calendar_create":
+      return executeGoogleTool(toolName, input, ctx);
     default:
       return { output: `Unknown tool: ${toolName}`, isError: true };
   }
@@ -708,10 +860,6 @@ async function executeSSHExec(
   input: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  if (!ctx.vault) {
-    return { output: "SSH requires the credential vault (no R2 storage configured)", isError: true };
-  }
-
   const host = String(input.host ?? "");
   const command = String(input.command ?? "");
   const user = String(input.user ?? "root");
@@ -721,6 +869,22 @@ async function executeSSHExec(
 
   if (!host) return { output: "Missing 'host' parameter", isError: true };
   if (!command) return { output: "Missing 'command' parameter", isError: true };
+
+  // Validate host and user to prevent SSH flag/command injection
+  // Must check BEFORE vault/policy to block injection regardless of config
+  if (!/^[a-zA-Z0-9._-]+$/.test(host)) {
+    return { output: "Invalid host: must contain only alphanumeric characters, dots, hyphens, and underscores", isError: true };
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(user)) {
+    return { output: "Invalid user: must contain only alphanumeric characters, dots, hyphens, and underscores", isError: true };
+  }
+  if (port < 1 || port > 65535) {
+    return { output: "Invalid port: must be between 1 and 65535", isError: true };
+  }
+
+  if (!ctx.vault) {
+    return { output: "SSH requires the credential vault (no R2 storage configured)", isError: true };
+  }
 
   const target = `${user}@${host}:${port}`;
 
@@ -774,6 +938,26 @@ async function executeSSHExec(
 
 // --- Git Tool ---
 
+/**
+ * Sanitize git args to prevent command injection.
+ * Splits on whitespace, rejects any token containing shell metacharacters,
+ * and re-joins with spaces. This blocks `;`, `|`, `&`, `$`, backticks, etc.
+ */
+function sanitizeGitArgs(raw: string): string {
+  const tokens = raw.trim().split(/\s+/);
+  const safe: string[] = [];
+  for (const token of tokens) {
+    // Allow flags (--flag, -f), alphanumeric, dots, slashes, colons, equals, tildes, percent (for git format strings)
+    if (/^[a-zA-Z0-9_./:=@~^%-]+$/.test(token)) {
+      safe.push(token);
+    } else {
+      // Reject tokens with shell metacharacters
+      throw new Error(`Unsafe character in git args: ${JSON.stringify(token)}`);
+    }
+  }
+  return safe.join(" ");
+}
+
 async function executeGit(
   input: Record<string, unknown>,
   ctx: ToolContext
@@ -784,7 +968,18 @@ async function executeGit(
   const message = String(input.message ?? "");
   const branch = String(input.branch ?? "");
   const keyName = String(input.key_name ?? "GIT_DEPLOY_KEY");
-  const args = String(input.args ?? "");
+  const rawArgs = String(input.args ?? "");
+
+  // Sanitize git args: only allow flags (--flag, -f), alphanumeric values, and safe characters.
+  // Block shell metacharacters that could enable command injection.
+  let args: string;
+  try {
+    args = rawArgs ? sanitizeGitArgs(rawArgs) : "";
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    ctx.audit.log(ctx.agentId, "git", `${action} args_blocked`, "blocked", msg);
+    return { output: `BLOCKED: ${msg}`, isError: true };
+  }
 
   const target = `${action} ${repo || path}`;
 
@@ -990,13 +1185,55 @@ async function executeSchedule(
 
 // --- Sub-Agent Tool ---
 
+interface SubAgentTask {
+  task: string;
+  role?: string;
+  model?: string;
+}
+
+/** Build auth headers for Worker API calls */
+function workerHeaders(ctx: ToolContext, contentType?: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (ctx.ownerToken) headers["Authorization"] = `Bearer ${ctx.ownerToken}`;
+  if (contentType) headers["Content-Type"] = contentType;
+  return headers;
+}
+
+async function spawnOneSubAgent(
+  task: string,
+  opts: { role?: string; name?: string; systemPrompt?: string; model?: string },
+  ctx: ToolContext,
+  timeoutMs: number
+): Promise<{ text?: string; error?: string; stats?: Record<string, unknown> }> {
+  const spawnUrl = `${ctx.workerUrl}/api/agent/${ctx.parentAgentName}/spawn-sub-agent`;
+  const response = await fetch(spawnUrl, {
+    method: "POST",
+    headers: workerHeaders(ctx, "application/json"),
+    body: JSON.stringify({
+      task,
+      name: opts.name,
+      systemPrompt: opts.systemPrompt,
+      model: opts.model,
+      role: opts.role,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    return { error: `HTTP ${response.status}: ${err.slice(0, 500)}` };
+  }
+
+  return (await response.json()) as { text?: string; error?: string; stats?: Record<string, unknown> };
+}
+
 async function executeSubAgent(
   input: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
   if (!ctx.subAgentsEnabled) {
     return {
-      output: "Sub-agents are not enabled for this agent. Enable in Settings > Sub-Agents.",
+      output: "Sub-agents are not enabled. Enable the Multi-Agent add-on in your deploy settings.",
       isError: true,
     };
   }
@@ -1008,45 +1245,74 @@ async function executeSubAgent(
     };
   }
 
-  const task = String(input.task ?? "");
+  const timeoutMs = Math.min(Number(input.timeout_ms) || 120000, 300000);
   const name = input.name ? String(input.name) : undefined;
   const systemPrompt = input.systemPrompt ? String(input.systemPrompt) : undefined;
   const model = input.model ? String(input.model) : undefined;
-  const timeoutMs = Math.min(Number(input.timeout_ms) || 120000, 300000);
+  const role = input.role ? String(input.role) : undefined;
 
-  if (!task) return { output: "Missing 'task' parameter", isError: true };
+  // Parallel mode: multiple tasks
+  const tasks = input.tasks as SubAgentTask[] | undefined;
+  if (Array.isArray(tasks) && tasks.length > 0) {
+    // Policy check on all tasks
+    for (const t of tasks) {
+      const decision = ctx.policy.evaluate("sub_agent", (t.task ?? "").slice(0, 200));
+      ctx.audit.log(ctx.agentId, "sub_agent", `parallel-spawn: ${(t.task ?? "").slice(0, 200)}`,
+        decision.allowed ? "allowed" : "blocked", decision.reason);
+      if (!decision.allowed) {
+        return { output: `BLOCKED by security policy: ${decision.reason}`, isError: true };
+      }
+    }
+
+    // Cap at 10 parallel tasks
+    const capped = tasks.slice(0, 10);
+
+    const results = await Promise.allSettled(
+      capped.map((t, i) =>
+        spawnOneSubAgent(
+          String(t.task ?? ""),
+          { role: t.role, model: t.model ?? model, systemPrompt },
+          ctx,
+          timeoutMs
+        ).then(r => ({ index: i, role: t.role, ...r }))
+      )
+    );
+
+    const lines: string[] = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const label = capped[i].role ?? `task-${i + 1}`;
+      if (r.status === "fulfilled") {
+        if (r.value.error) {
+          lines.push(`[${label}] ERROR: ${r.value.error}`);
+        } else {
+          lines.push(`[${label}]\n${r.value.text ?? "(no response)"}`);
+        }
+      } else {
+        lines.push(`[${label}] FAILED: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+      }
+    }
+
+    return {
+      output: `[Parallel sub-agent results (${capped.length} tasks)]\n\n${lines.join("\n\n---\n\n")}`,
+      isError: false,
+    };
+  }
+
+  // Single task mode
+  const task = String(input.task ?? "");
+  if (!task) return { output: "Provide either 'task' (single) or 'tasks' (parallel array)", isError: true };
 
   // Policy check
   const decision = ctx.policy.evaluate("sub_agent", task.slice(0, 200));
-  ctx.audit.log(
-    ctx.agentId,
-    "sub_agent",
-    `spawn: ${task.slice(0, 200)}`,
-    decision.allowed ? "allowed" : "blocked",
-    decision.reason
-  );
+  ctx.audit.log(ctx.agentId, "sub_agent", `spawn: ${task.slice(0, 200)}`,
+    decision.allowed ? "allowed" : "blocked", decision.reason);
   if (!decision.allowed) {
     return { output: `BLOCKED by security policy: ${decision.reason}`, isError: true };
   }
 
   try {
-    const spawnUrl = `${ctx.workerUrl}/api/agent/${ctx.parentAgentName}/spawn-sub-agent`;
-    const response = await fetch(spawnUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task, name, systemPrompt, model }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      return {
-        output: `Sub-agent spawn failed (HTTP ${response.status}): ${err.slice(0, 500)}`,
-        isError: true,
-      };
-    }
-
-    const result = (await response.json()) as { text?: string; error?: string; stats?: Record<string, unknown> };
+    const result = await spawnOneSubAgent(task, { role, name, systemPrompt, model }, ctx, timeoutMs);
 
     if (result.error) {
       return { output: `Sub-agent error: ${result.error}`, isError: true };
@@ -1055,13 +1321,246 @@ async function executeSubAgent(
     const stats = result.stats
       ? `\n[sub-agent stats: ${JSON.stringify(result.stats)}]`
       : "";
+    const roleLabel = role ? ` (${role})` : "";
 
     return {
-      output: `[Sub-agent result]\n${result.text ?? "(no response)"}${stats}`,
+      output: `[Sub-agent result${roleLabel}]\n${result.text ?? "(no response)"}${stats}`,
       isError: false,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { output: `Sub-agent error: ${msg}`, isError: true };
+  }
+}
+
+// --- Agent-to-Agent Messaging Tool ---
+
+async function executeMessageAgent(
+  input: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (!ctx.agentMessagingEnabled) {
+    return {
+      output: "Agent messaging is not enabled. Enable the Multi-Agent add-on to unlock.",
+      isError: true,
+    };
+  }
+
+  if (!ctx.workerUrl || !ctx.parentAgentName) {
+    return {
+      output: "Agent messaging requires cloud deployment.",
+      isError: true,
+    };
+  }
+
+  // Sanitize agent name the same way the Worker does (lowercase, alphanumeric + hyphens)
+  const agent = String(input.agent ?? "").toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
+  const message = String(input.message ?? "");
+  const chatId = input.chatId ? String(input.chatId) : undefined;
+  const timeoutMs = Math.min(Number(input.timeout_ms) || 120000, 300000);
+
+  if (!agent || !message) {
+    return { output: "Missing 'agent' or 'message' parameter", isError: true };
+  }
+
+  if (agent === ctx.parentAgentName) {
+    return { output: "Cannot message yourself. Use a different agent name.", isError: true };
+  }
+
+  // Policy check
+  const decision = ctx.policy.evaluate("message_agent", `to:${agent} msg:${message.slice(0, 200)}`);
+  ctx.audit.log(ctx.agentId, "message_agent", `to:${agent} msg:${message.slice(0, 200)}`,
+    decision.allowed ? "allowed" : "blocked", decision.reason);
+  if (!decision.allowed) {
+    return { output: `BLOCKED by security policy: ${decision.reason}`, isError: true };
+  }
+
+  try {
+    const url = `${ctx.workerUrl}/api/agent/${ctx.parentAgentName}/message-agent`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: workerHeaders(ctx, "application/json"),
+      body: JSON.stringify({ targetAgent: agent, message, chatId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      return {
+        output: `Message to ${agent} failed (HTTP ${response.status}): ${err.slice(0, 500)}`,
+        isError: true,
+      };
+    }
+
+    const result = (await response.json()) as { text?: string; error?: string; stats?: Record<string, unknown> };
+
+    if (result.error) {
+      return { output: `Error from ${agent}: ${result.error}`, isError: true };
+    }
+
+    return {
+      output: `[Response from ${agent}]\n${result.text ?? "(no response)"}`,
+      isError: false,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { output: `Message error: ${msg}`, isError: true };
+  }
+}
+
+// --- Shared Team Storage Tool ---
+
+async function executeTeamStorage(
+  input: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (!ctx.teamStorageEnabled) {
+    return {
+      output: "Team storage is not enabled. Enable the Multi-Agent add-on to unlock.",
+      isError: true,
+    };
+  }
+
+  if (!ctx.workerUrl || !ctx.parentAgentName) {
+    return {
+      output: "Team storage requires cloud deployment.",
+      isError: true,
+    };
+  }
+
+  const action = String(input.action ?? "");
+  const key = input.key ? String(input.key) : undefined;
+  const data = input.data ? String(input.data) : undefined;
+  const prefix = input.prefix ? String(input.prefix) : undefined;
+
+  if (!action) return { output: "Missing 'action' parameter", isError: true };
+
+  // Policy check
+  const desc = `${action}:${key ?? prefix ?? ""}`;
+  const decision = ctx.policy.evaluate("team_storage", desc.slice(0, 200));
+  ctx.audit.log(ctx.agentId, "team_storage", desc.slice(0, 200),
+    decision.allowed ? "allowed" : "blocked", decision.reason);
+  if (!decision.allowed) {
+    return { output: `BLOCKED by security policy: ${decision.reason}`, isError: true };
+  }
+
+  try {
+    const baseUrl = `${ctx.workerUrl}/api/agent/${ctx.parentAgentName}/team-storage`;
+
+    const timeout = AbortSignal.timeout(30_000);
+
+    switch (action) {
+      case "get": {
+        if (!key) return { output: "Missing 'key' parameter for get", isError: true };
+        const res = await fetch(`${baseUrl}/${encodeURIComponent(key)}`, {
+          headers: workerHeaders(ctx), signal: timeout,
+        });
+        if (res.status === 404) return { output: `Key not found: ${key}`, isError: true };
+        if (!res.ok) return { output: `Get failed: ${await res.text()}`, isError: true };
+        const content = await res.text();
+        return { output: content, isError: false };
+      }
+      case "put": {
+        if (!key) return { output: "Missing 'key' parameter for put", isError: true };
+        if (!data) return { output: "Missing 'data' parameter for put", isError: true };
+        if (data.length > 1_048_576) return { output: "Data exceeds 1MB limit", isError: true };
+        const res = await fetch(`${baseUrl}/${encodeURIComponent(key)}`, {
+          method: "PUT",
+          headers: workerHeaders(ctx, "application/octet-stream"),
+          body: data,
+          signal: timeout,
+        });
+        if (!res.ok) return { output: `Put failed: ${await res.text()}`, isError: true };
+        return { output: `Stored: ${key} (${data.length} bytes)`, isError: false };
+      }
+      case "delete": {
+        if (!key) return { output: "Missing 'key' parameter for delete", isError: true };
+        const res = await fetch(`${baseUrl}/${encodeURIComponent(key)}`, {
+          method: "DELETE", headers: workerHeaders(ctx), signal: timeout,
+        });
+        if (!res.ok) return { output: `Delete failed: ${await res.text()}`, isError: true };
+        return { output: `Deleted: ${key}`, isError: false };
+      }
+      case "list": {
+        const queryPrefix = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
+        const res = await fetch(`${baseUrl}${queryPrefix}`, {
+          headers: workerHeaders(ctx), signal: timeout,
+        });
+        if (!res.ok) return { output: `List failed: ${await res.text()}`, isError: true };
+        const result = (await res.json()) as { keys: string[] };
+        if (result.keys.length === 0) return { output: "No items found", isError: false };
+        return { output: `Team storage (${result.keys.length} items):\n${result.keys.map(k => `  ${k}`).join("\n")}`, isError: false };
+      }
+      default:
+        return { output: `Unknown action: ${action}. Use: get, put, delete, list`, isError: true };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { output: `Team storage error: ${msg}`, isError: true };
+  }
+}
+
+// --- Agent Discovery Tool ---
+
+async function executeListAgents(
+  _input: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (!ctx.agentMessagingEnabled) {
+    return {
+      output: "Agent discovery is not enabled. Enable the Multi-Agent add-on to unlock.",
+      isError: true,
+    };
+  }
+
+  if (!ctx.workerUrl || !ctx.parentAgentName) {
+    return {
+      output: "Agent discovery requires cloud deployment.",
+      isError: true,
+    };
+  }
+
+  // Policy check + audit
+  const decision = ctx.policy.evaluate("list_agents", ctx.parentAgentName!);
+  ctx.audit.log(ctx.agentId, "list_agents", ctx.parentAgentName!,
+    decision.allowed ? "allowed" : "blocked", decision.reason);
+  if (!decision.allowed) {
+    return { output: `BLOCKED by security policy: ${decision.reason}`, isError: true };
+  }
+
+  try {
+    const url = `${ctx.workerUrl}/api/agent/${ctx.parentAgentName}/team-agents`;
+    const response = await fetch(url, {
+      headers: workerHeaders(ctx),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!response.ok) {
+      return {
+        output: `Discovery failed: ${await response.text()}`,
+        isError: true,
+      };
+    }
+
+    const result = (await response.json()) as {
+      agents: Array<{ name: string; model?: string; systemPrompt?: string; createdAt?: string }>;
+    };
+
+    if (result.agents.length === 0) {
+      return { output: "No other agents found in your team.", isError: false };
+    }
+
+    const lines = result.agents.map(a => {
+      const prompt = a.systemPrompt ? ` — "${a.systemPrompt.slice(0, 100)}"` : "";
+      return `  ${a.name} (${a.model ?? "unknown"})${prompt}`;
+    });
+
+    return {
+      output: `[Team agents (${result.agents.length})]\n${lines.join("\n")}`,
+      isError: false,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { output: `Discovery error: ${msg}`, isError: true };
   }
 }

@@ -23,7 +23,9 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
+import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
+import { BoundedConversationMap } from "./conversation-map.js";
 
 /** Minimal event shape covering both app_mention and message events */
 interface SlackEvent {
@@ -44,6 +46,7 @@ interface SlackConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
+  consensus?: ConsensusOrchestrator;
   allowedChannelIds?: string[];
 }
 
@@ -53,15 +56,17 @@ export class SlackIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
+  private consensus?: ConsensusOrchestrator;
   private allowedChannelIds: Set<string> | null;
   private connected = false;
   private botUserId: string | null = null;
-  private conversations: Map<string, MessageParam[]> = new Map();
+  private conversations = new BoundedConversationMap<string>();
 
   constructor(config: SlackConfig) {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
+    this.consensus = config.consensus;
     this.allowedChannelIds = config.allowedChannelIds
       ? new Set(config.allowedChannelIds)
       : null;
@@ -160,11 +165,7 @@ export class SlackIntegration implements Integration {
     }
 
     // Get or create conversation history
-    let history = this.conversations.get(key);
-    if (!history) {
-      history = [];
-      this.conversations.set(key, history);
-    }
+    const history = this.conversations.getOrCreate(key);
 
     try {
       // Route through model router if available
@@ -175,13 +176,17 @@ export class SlackIntegration implements Integration {
         console.log(`  [slack:router] ${route.classification} → ${selectedLLM.getModel()}`);
       }
 
-      const response = await runAgentLoop(text, history, {
+      const loopConfig = {
         llm: selectedLLM,
         toolContext: this.toolContext,
-        onToolCall(name, input) {
+        onToolCall(name: string, input: Record<string, unknown>) {
           console.log(`  [slack:tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
         },
-      });
+      };
+
+      const response = this.consensus
+        ? await this.consensus.run(text, history, loopConfig)
+        : await runAgentLoop(text, history, loopConfig);
 
       // Send response (split into chunks if too long)
       const responseText = response.text || "(No response)";

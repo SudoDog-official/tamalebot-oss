@@ -37,6 +37,7 @@ const model = process.env.TAMALEBOT_MODEL ?? undefined;
 const provider = process.env.TAMALEBOT_PROVIDER ?? undefined;
 const agentName = process.env.TAMALEBOT_AGENT_NAME ?? "TamaleBot Agent";
 const mode = process.env.TAMALEBOT_MODE ?? "repl";
+const mockLLM = process.env.TAMALEBOT_MOCK_LLM === "true";
 const systemPromptOverride = process.env.TAMALEBOT_SYSTEM_PROMPT ?? "";
 
 // Agent Skills
@@ -84,6 +85,15 @@ const contextCompressionEnabled = process.env.TAMALEBOT_CONTEXT_COMPRESSION !== 
 // Sub-agent capability
 const subAgentsEnabled = process.env.TAMALEBOT_SUB_AGENTS_ENABLED === "true";
 const workerUrl = process.env.TAMALEBOT_WORKER_URL || "";
+
+// Multi-agent collaboration (enabled alongside sub-agents)
+const agentMessagingEnabled = process.env.TAMALEBOT_AGENT_MESSAGING === "true";
+const teamStorageEnabled = process.env.TAMALEBOT_TEAM_STORAGE === "true";
+const ownerToken = process.env.TAMALEBOT_OWNER_TOKEN || "";
+
+// Consensus mode (multi-perspective debate/synthesis)
+const consensusEnabled = process.env.TAMALEBOT_CONSENSUS === "true";
+const consensusAgents = Math.max(2, Math.min(5, Number(process.env.TAMALEBOT_CONSENSUS_AGENTS) || 3));
 
 // Built-in safe domains for default-deny outbound mode
 const BUILTIN_SAFE_DOMAINS = [
@@ -184,8 +194,12 @@ class ConversationManager {
   async flush(): Promise<void> {
     if (!this.storage || this.dirty.size === 0) return;
 
+    // Snapshot and clear dirty set to avoid race with concurrent requests
+    const toFlush = new Set(this.dirty);
+    this.dirty.clear();
+
     const promises: Promise<void>[] = [];
-    for (const chatId of this.dirty) {
+    for (const chatId of toFlush) {
       const history = this.cache.get(chatId);
       if (history) {
         promises.push(
@@ -194,12 +208,13 @@ class ConversationManager {
             JSON.stringify(history)
           ).catch((err) => {
             console.error(`[memory] Failed to save ${chatId}: ${err instanceof Error ? err.message : err}`);
+            // Re-mark as dirty so next flush retries
+            this.dirty.add(chatId);
           }) as Promise<void>
         );
       }
     }
     await Promise.all(promises);
-    this.dirty.clear();
   }
 
   delete(chatId: string): void {
@@ -258,29 +273,19 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(body);
 }
 
-async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRouter?: import("./model-router.js").ModelRouter): Promise<void> {
+async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRouter?: import("./model-router.js").ModelRouter, consensus?: import("./consensus.js").ConsensusOrchestrator): Promise<void> {
   const port = Number(process.env.PORT) || 8080;
   const startTime = Date.now();
 
-  // Initialize storage backend
+  // Initialize storage backend (R2 if worker URL available, otherwise in-memory only)
   const workerUrl = process.env.TAMALEBOT_WORKER_URL;
   const sanitizedName = (process.env.TAMALEBOT_AGENT_NAME ?? "agent")
     .toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
   let storage: StorageBackend | null = null;
   if (workerUrl) {
-    try {
-      const { R2Storage } = await import("../storage/r2.js");
-      storage = new R2Storage(workerUrl, sanitizedName);
-      console.log("[tamalebot-agent] R2 persistent storage enabled");
-    } catch {
-      // R2 backend not available (e.g., self-hosted) — fall through to local
-    }
-  }
-  if (!storage) {
-    const { LocalStorage } = await import("../storage/index.js");
-    const storagePath = process.env.TAMALEBOT_STORAGE_PATH ?? "/tmp/workspace/.tamalebot-data";
-    storage = new LocalStorage(storagePath);
-    console.log(`[tamalebot-agent] Local persistent storage at ${storagePath}`);
+    const { R2Storage } = await import("../storage/r2.js");
+    storage = new R2Storage(workerUrl, sanitizedName);
+    console.log("[tamalebot-agent] R2 persistent memory enabled");
   }
 
   // Per-chat conversation histories (in-memory + R2 persistence)
@@ -353,19 +358,23 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
           console.log(`  [router] ${route.classification} → ${selectedLLM.getModel()}`);
         }
 
-        const response = await runAgentLoop(text, history, {
+        const loopConfig = {
           llm: selectedLLM,
           toolContext,
           compression: { enabled: contextCompressionEnabled },
-          onToolCall(name, input) {
+          onToolCall(name: string, input: Record<string, unknown>) {
             console.log(`  [tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
           },
-          onToolResult(name, output, isError) {
+          onToolResult(name: string, output: string, isError: boolean) {
             if (isError) {
               console.log(`  [tool] ${name}: ERROR - ${output.slice(0, 200)}`);
             }
           },
-        });
+        };
+
+        const response = consensus
+          ? await consensus.run(text, history, loopConfig)
+          : await runAgentLoop(text, history, loopConfig);
 
         // Persist conversation to R2
         conversations.markDirty(conversationKey);
@@ -382,6 +391,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
             cacheCreation: response.totalCacheCreationTokens,
             cacheRead: response.totalCacheReadTokens,
             ...(routeInfo ? { router: routeInfo } : {}),
+            ...(consensus ? { consensus: true } : {}),
           },
         });
       } catch (err) {
@@ -418,13 +428,19 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
     if (path === "/clear" && req.method === "POST") {
       try {
         const body = await parseBody(req);
-        const { chatId } = JSON.parse(body || "{}") as { chatId?: string };
-        const key = chatId ?? "default";
-        conversations.delete(key);
-        sendJson(res, 200, { cleared: true, chatId: key });
+        const parsed = JSON.parse(body || "{}") as { chatId?: string; all?: boolean };
+        if (parsed.all === true) {
+          conversations.clear();
+          sendJson(res, 200, { cleared: true, chatId: "all" });
+        } else {
+          const key = parsed.chatId ?? "default";
+          conversations.delete(key);
+          sendJson(res, 200, { cleared: true, chatId: key });
+        }
       } catch {
-        conversations.clear();
-        sendJson(res, 200, { cleared: true, chatId: "all" });
+        // Invalid JSON should NOT clear all conversations — clear default only
+        conversations.delete("default");
+        sendJson(res, 200, { cleared: true, chatId: "default" });
       }
       return;
     }
@@ -679,6 +695,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
+      consensus,
     });
     await telegram.connect();
     console.log("[tamalebot-agent] Telegram integration started");
@@ -693,6 +710,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
+      consensus,
     });
     await discord.connect();
     console.log("[tamalebot-agent] Discord integration started");
@@ -711,6 +729,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
+      consensus,
     });
     await whatsappIntegration.connect();
     console.log("[tamalebot-agent] WhatsApp integration started");
@@ -727,6 +746,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
+      consensus,
     });
     await slack.connect();
     console.log("[tamalebot-agent] Slack integration started");
@@ -750,6 +770,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
+      consensus,
       allowedSenders: process.env.EMAIL_ALLOWED_SENDERS
         ? process.env.EMAIL_ALLOWED_SENDERS.split(",").map(s => s.trim().toLowerCase()).filter(Boolean)
         : undefined,
@@ -884,21 +905,31 @@ async function startRepl(llm: LLMClient, toolContext: ToolContext): Promise<void
 // --- Main ---
 
 async function main(): Promise<void> {
-  if (!apiKey) {
+  if (!mockLLM && !apiKey) {
     console.error(
       "[tamalebot-agent] Error: No API key found.\n" +
       "  Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, MOONSHOT_API_KEY,\n" +
-      "  GOOGLE_API_KEY, MINIMAX_API_KEY, or TAMALEBOT_API_KEY"
+      "  GOOGLE_API_KEY, MINIMAX_API_KEY, or TAMALEBOT_API_KEY\n" +
+      "  Or set TAMALEBOT_MOCK_LLM=true for testing without an API key"
     );
     process.exit(1);
   }
 
-  const llm = new LLMClient({
-    apiKey,
-    provider: provider as import("./llm-client.js").LLMProvider | undefined,
-    model,
-    systemPrompt: await buildSystemPrompt(),
-  });
+  const systemPrompt = await buildSystemPrompt();
+
+  let llm: LLMClient;
+  if (mockLLM) {
+    const { MockLLMClient } = await import("./mock-llm.js");
+    llm = new MockLLMClient({ systemPrompt, model: model ?? "mock-model" }) as unknown as LLMClient;
+    console.log("[tamalebot-agent] Using MOCK LLM (no API calls will be made)");
+  } else {
+    llm = new LLMClient({
+      apiKey,
+      provider: provider as import("./llm-client.js").LLMProvider | undefined,
+      model,
+      systemPrompt,
+    });
+  }
 
   const toolContext: ToolContext = {
     policy,
@@ -912,7 +943,24 @@ async function main(): Promise<void> {
     parentAgentName: (process.env.TAMALEBOT_AGENT_NAME ?? "agent")
       .toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 64),
     subAgentsEnabled,
+    agentMessagingEnabled,
+    teamStorageEnabled,
+    ownerToken: ownerToken || undefined,
   };
+
+  // Google Workspace tools (optional — requires OAuth credentials)
+  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const googleRefreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (googleClientId && googleClientSecret && googleRefreshToken) {
+    const { GoogleAuth } = await import("./google-auth.js");
+    toolContext.googleAuth = new GoogleAuth({
+      clientId: googleClientId,
+      clientSecret: googleClientSecret,
+      refreshToken: googleRefreshToken,
+    });
+    console.log("[tamalebot-agent] Google Workspace tools enabled");
+  }
 
   // Model Router (optional — reduces cost by routing simple messages to cheap model)
   const routerModel = process.env.TAMALEBOT_ROUTER_MODEL;
@@ -929,6 +977,14 @@ async function main(): Promise<void> {
     console.log(`[tamalebot-agent] Model router enabled: ${routerModel} (cheap) / ${llm.getModel()} (primary)`);
   }
 
+  // Consensus mode (optional — multi-perspective debate for better answers)
+  let consensus: import("./consensus.js").ConsensusOrchestrator | undefined;
+  if (consensusEnabled) {
+    const { ConsensusOrchestrator } = await import("./consensus.js");
+    consensus = new ConsensusOrchestrator({ llm, agentCount: consensusAgents });
+    console.log(`[tamalebot-agent] Consensus mode enabled: ${consensusAgents} perspectives`);
+  }
+
   console.log(`[tamalebot-agent] Agent "${agentName}" (${agentId}) starting`);
   console.log(`[tamalebot-agent] Provider: ${llm.getProvider()}`);
   console.log(`[tamalebot-agent] Model: ${llm.getModel()}`);
@@ -943,7 +999,7 @@ async function main(): Promise<void> {
   });
 
   if (mode === "http") {
-    await startHttpServer(llm, toolContext, modelRouter);
+    await startHttpServer(llm, toolContext, modelRouter, consensus);
   } else {
     await startRepl(llm, toolContext);
   }

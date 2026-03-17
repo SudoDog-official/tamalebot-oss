@@ -21,7 +21,9 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
+import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
+import { BoundedConversationMap } from "./conversation-map.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot";
 
@@ -41,6 +43,7 @@ interface TelegramConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
+  consensus?: ConsensusOrchestrator;
   allowedChatIds?: number[];
 }
 
@@ -50,16 +53,18 @@ export class TelegramIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
+  private consensus?: ConsensusOrchestrator;
   private allowedChatIds: Set<number> | null;
   private running = false;
   private offset = 0;
-  private conversations: Map<number, MessageParam[]> = new Map();
+  private conversations = new BoundedConversationMap<number>();
 
   constructor(config: TelegramConfig) {
     this.token = config.botToken;
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
+    this.consensus = config.consensus;
     this.allowedChatIds = config.allowedChatIds
       ? new Set(config.allowedChatIds)
       : null;
@@ -74,7 +79,10 @@ export class TelegramIntegration implements Integration {
 
     console.log(`[telegram] Connected as @${me.result.username}`);
     this.running = true;
-    this.pollLoop();
+    this.pollLoop().catch((err) => {
+      console.error(`[telegram] Poll loop fatal error: ${err instanceof Error ? err.message : err}`);
+      this.running = false;
+    });
   }
 
   async disconnect(): Promise<void> {
@@ -163,11 +171,7 @@ export class TelegramIntegration implements Integration {
     await this.apiCall("sendChatAction", { chat_id: chatId, action: "typing" });
 
     // Get or create conversation history for this chat
-    let history = this.conversations.get(chatId);
-    if (!history) {
-      history = [];
-      this.conversations.set(chatId, history);
-    }
+    const history = this.conversations.getOrCreate(chatId);
 
     try {
       // Route through model router if available
@@ -178,13 +182,17 @@ export class TelegramIntegration implements Integration {
         console.log(`  [telegram:router] ${route.classification} → ${selectedLLM.getModel()}`);
       }
 
-      const response = await runAgentLoop(text, history, {
+      const loopConfig = {
         llm: selectedLLM,
         toolContext: this.toolContext,
-        onToolCall(name, input) {
+        onToolCall(name: string, input: Record<string, unknown>) {
           console.log(`  [telegram:tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
         },
-      });
+      };
+
+      const response = this.consensus
+        ? await this.consensus.run(text, history, loopConfig)
+        : await runAgentLoop(text, history, loopConfig);
 
       // Send response (split into chunks if too long for Telegram's 4096 char limit)
       const responseText = response.text || "(No response)";

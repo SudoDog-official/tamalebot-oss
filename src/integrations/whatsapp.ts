@@ -13,7 +13,7 @@
  * 3. Get a permanent access token, phone number ID, and set a verify token
  * 4. Set WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_VERIFY_TOKEN in your environment
  * 5. Register your webhook URL:
- *    https://your-host/api/agent/{name}/webhook/whatsapp
+ *    https://tamalebot-worker.om-d67.workers.dev/api/agent/{name}/webhook/whatsapp
  *
  * Free tier: 1,000 service conversations/month, unlimited inbound messages.
  */
@@ -23,7 +23,9 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
+import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
+import { BoundedConversationMap } from "./conversation-map.js";
 
 const GRAPH_API = "https://graph.facebook.com/v21.0";
 
@@ -34,6 +36,7 @@ interface WhatsAppConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
+  consensus?: ConsensusOrchestrator;
 }
 
 export class WhatsAppIntegration implements Integration {
@@ -44,7 +47,8 @@ export class WhatsAppIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private conversations: Map<string, MessageParam[]> = new Map();
+  private consensus?: ConsensusOrchestrator;
+  private conversations = new BoundedConversationMap<string>();
   private connected = false;
 
   constructor(config: WhatsAppConfig) {
@@ -54,6 +58,7 @@ export class WhatsAppIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
+    this.consensus = config.consensus;
   }
 
   async connect(): Promise<void> {
@@ -165,11 +170,7 @@ export class WhatsAppIntegration implements Integration {
     }
 
     // Get or create conversation history
-    let history = this.conversations.get(from);
-    if (!history) {
-      history = [];
-      this.conversations.set(from, history);
-    }
+    const history = this.conversations.getOrCreate(from);
 
     try {
       // Route through model router if available
@@ -180,13 +181,17 @@ export class WhatsAppIntegration implements Integration {
         console.log(`  [whatsapp:router] ${route.classification} → ${selectedLLM.getModel()}`);
       }
 
-      const response = await runAgentLoop(text, history, {
+      const loopConfig = {
         llm: selectedLLM,
         toolContext: this.toolContext,
-        onToolCall(name, input) {
+        onToolCall(name: string, input: Record<string, unknown>) {
           console.log(`  [whatsapp:tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
         },
-      });
+      };
+
+      const response = this.consensus
+        ? await this.consensus.run(text, history, loopConfig)
+        : await runAgentLoop(text, history, loopConfig);
 
       const responseText = response.text || "(No response)";
       await this.sendLongMessage(from, responseText);

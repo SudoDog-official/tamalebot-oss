@@ -29,13 +29,16 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
+import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
+import { BoundedConversationMap } from "./conversation-map.js";
 
 interface DiscordConfig {
   botToken: string;
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
+  consensus?: ConsensusOrchestrator;
   allowedGuildIds?: string[];
 }
 
@@ -46,8 +49,9 @@ export class DiscordIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
+  private consensus?: ConsensusOrchestrator;
   private allowedGuildIds: Set<string> | null;
-  private conversations: Map<string, MessageParam[]> = new Map();
+  private conversations = new BoundedConversationMap<string>();
   private connected = false;
 
   constructor(config: DiscordConfig) {
@@ -55,6 +59,7 @@ export class DiscordIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
+    this.consensus = config.consensus;
     this.allowedGuildIds = config.allowedGuildIds
       ? new Set(config.allowedGuildIds)
       : null;
@@ -152,11 +157,7 @@ export class DiscordIntegration implements Integration {
 
     // Get or create conversation history
     const key = this.getConversationKey(msg);
-    let history = this.conversations.get(key);
-    if (!history) {
-      history = [];
-      this.conversations.set(key, history);
-    }
+    const history = this.conversations.getOrCreate(key);
 
     try {
       // Route through model router if available
@@ -167,13 +168,17 @@ export class DiscordIntegration implements Integration {
         console.log(`  [discord:router] ${route.classification} → ${selectedLLM.getModel()}`);
       }
 
-      const response = await runAgentLoop(text, history, {
+      const loopConfig = {
         llm: selectedLLM,
         toolContext: this.toolContext,
-        onToolCall(name, input) {
+        onToolCall(name: string, input: Record<string, unknown>) {
           console.log(`  [discord:tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
         },
-      });
+      };
+
+      const response = this.consensus
+        ? await this.consensus.run(text, history, loopConfig)
+        : await runAgentLoop(text, history, loopConfig);
 
       // Send response (chunked for Discord's 2000 char limit)
       const responseText = response.text || "(No response)";

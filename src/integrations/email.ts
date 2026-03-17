@@ -24,7 +24,9 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
+import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
+import { BoundedConversationMap } from "./conversation-map.js";
 
 interface EmailConfig {
   imapHost: string;
@@ -38,6 +40,7 @@ interface EmailConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
+  consensus?: ConsensusOrchestrator;
   allowedSenders?: string[];
 }
 
@@ -49,8 +52,9 @@ export class EmailIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
+  private consensus?: ConsensusOrchestrator;
   private allowedSenders: Set<string> | null;
-  private conversations: Map<string, MessageParam[]> = new Map();
+  private conversations = new BoundedConversationMap<string>();
   private connected = false;
   private running = false;
 
@@ -59,6 +63,7 @@ export class EmailIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
+    this.consensus = config.consensus;
     this.allowedSenders = config.allowedSenders
       ? new Set(config.allowedSenders.map((s) => s.toLowerCase()))
       : null;
@@ -205,11 +210,7 @@ export class EmailIntegration implements Integration {
     }
 
     // Conversation key: sender email
-    let history = this.conversations.get(from);
-    if (!history) {
-      history = [];
-      this.conversations.set(from, history);
-    }
+    const history = this.conversations.getOrCreate(from);
 
     try {
       // Route through model router if available
@@ -220,13 +221,17 @@ export class EmailIntegration implements Integration {
         console.log(`  [email:router] ${route.classification} → ${selectedLLM.getModel()}`);
       }
 
-      const response = await runAgentLoop(body, history, {
+      const loopConfig = {
         llm: selectedLLM,
         toolContext: this.toolContext,
-        onToolCall(name, input) {
+        onToolCall(name: string, input: Record<string, unknown>) {
           console.log(`  [email:tool] ${name}: ${JSON.stringify(input).slice(0, 80)}`);
         },
-      });
+      };
+
+      const response = this.consensus
+        ? await this.consensus.run(body, history, loopConfig)
+        : await runAgentLoop(body, history, loopConfig);
 
       let responseText = response.text || "(No response)";
       if (response.toolCallCount > 0) {
