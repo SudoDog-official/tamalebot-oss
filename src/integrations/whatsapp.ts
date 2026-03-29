@@ -13,17 +13,17 @@
  * 3. Get a permanent access token, phone number ID, and set a verify token
  * 4. Set WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_VERIFY_TOKEN in your environment
  * 5. Register your webhook URL:
- *    https://tamalebot-worker.om-d67.workers.dev/api/agent/{name}/webhook/whatsapp
+ *    https://your-worker-url.example.com/api/agent/{name}/webhook/whatsapp
  *
  * Free tier: 1,000 service conversations/month, unlimited inbound messages.
  */
 
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
-import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
 import { BoundedConversationMap } from "./conversation-map.js";
 
@@ -36,7 +36,7 @@ interface WhatsAppConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
-  consensus?: ConsensusOrchestrator;
+  appSecret?: string;
 }
 
 export class WhatsAppIntegration implements Integration {
@@ -47,7 +47,7 @@ export class WhatsAppIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private consensus?: ConsensusOrchestrator;
+  private appSecret?: string;
   private conversations = new BoundedConversationMap<string>();
   private connected = false;
 
@@ -58,7 +58,7 @@ export class WhatsAppIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
-    this.consensus = config.consensus;
+    this.appSecret = config.appSecret;
   }
 
   async connect(): Promise<void> {
@@ -105,6 +105,20 @@ export class WhatsAppIntegration implements Integration {
       return { status: 200, body: challenge || "" };
     }
     return { status: 403, body: "Forbidden" };
+  }
+
+  /**
+   * Verify the X-Hub-Signature-256 header from Meta's webhook POST.
+   * Returns true if no appSecret is configured (backwards-compatible) or if the signature matches.
+   */
+  verifySignature(rawBody: string, signatureHeader: string | null): boolean {
+    if (!this.appSecret) return true;
+    if (!signatureHeader) return false;
+    const expected = createHmac("sha256", this.appSecret).update(rawBody).digest("hex");
+    const expectedBuf = Buffer.from(`sha256=${expected}`, "utf-8");
+    const actualBuf = Buffer.from(signatureHeader, "utf-8");
+    if (expectedBuf.length !== actualBuf.length) return false;
+    return timingSafeEqual(expectedBuf, actualBuf);
   }
 
   /**
@@ -189,9 +203,7 @@ export class WhatsAppIntegration implements Integration {
         },
       };
 
-      const response = this.consensus
-        ? await this.consensus.run(text, history, loopConfig)
-        : await runAgentLoop(text, history, loopConfig);
+      const response = await runAgentLoop(text, history, loopConfig);
 
       const responseText = response.text || "(No response)";
       await this.sendLongMessage(from, responseText);

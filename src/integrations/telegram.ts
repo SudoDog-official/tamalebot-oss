@@ -21,7 +21,6 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
-import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
 import { BoundedConversationMap } from "./conversation-map.js";
 
@@ -43,7 +42,6 @@ interface TelegramConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
-  consensus?: ConsensusOrchestrator;
   allowedChatIds?: number[];
 }
 
@@ -53,7 +51,6 @@ export class TelegramIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private consensus?: ConsensusOrchestrator;
   private allowedChatIds: Set<number> | null;
   private running = false;
   private offset = 0;
@@ -64,7 +61,6 @@ export class TelegramIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
-    this.consensus = config.consensus;
     this.allowedChatIds = config.allowedChatIds
       ? new Set(config.allowedChatIds)
       : null;
@@ -190,9 +186,7 @@ export class TelegramIntegration implements Integration {
         },
       };
 
-      const response = this.consensus
-        ? await this.consensus.run(text, history, loopConfig)
-        : await runAgentLoop(text, history, loopConfig);
+      const response = await runAgentLoop(text, history, loopConfig);
 
       // Send response (split into chunks if too long for Telegram's 4096 char limit)
       const responseText = response.text || "(No response)";

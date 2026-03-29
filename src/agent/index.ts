@@ -91,9 +91,6 @@ const agentMessagingEnabled = process.env.TAMALEBOT_AGENT_MESSAGING === "true";
 const teamStorageEnabled = process.env.TAMALEBOT_TEAM_STORAGE === "true";
 const ownerToken = process.env.TAMALEBOT_OWNER_TOKEN || "";
 
-// Consensus mode (multi-perspective debate/synthesis)
-const consensusEnabled = process.env.TAMALEBOT_CONSENSUS === "true";
-const consensusAgents = Math.max(2, Math.min(5, Number(process.env.TAMALEBOT_CONSENSUS_AGENTS) || 3));
 
 // Built-in safe domains for default-deny outbound mode
 const BUILTIN_SAFE_DOMAINS = [
@@ -273,25 +270,20 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(body);
 }
 
-async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRouter?: import("./model-router.js").ModelRouter, consensus?: import("./consensus.js").ConsensusOrchestrator): Promise<void> {
+async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRouter?: import("./model-router.js").ModelRouter): Promise<void> {
   const port = Number(process.env.PORT) || 8080;
   const startTime = Date.now();
 
-  // Initialize storage backend (R2 if worker URL available, otherwise in-memory only)
-  const workerUrl = process.env.TAMALEBOT_WORKER_URL;
+  // Storage backend (pluggable — null in OSS, R2 in cloud deployments)
   const sanitizedName = (process.env.TAMALEBOT_AGENT_NAME ?? "agent")
     .toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
-  let storage: StorageBackend | null = null;
-  if (workerUrl) {
-    const { R2Storage } = await import("../storage/r2.js");
-    storage = new R2Storage(workerUrl, sanitizedName);
-    console.log("[tamalebot-agent] R2 persistent memory enabled");
-  }
+  // eslint-disable-next-line prefer-const -- assigned by cloud-specific bootstrapping
+  let storage = null as StorageBackend | null;
 
-  // Per-chat conversation histories (in-memory + R2 persistence)
+  // Per-chat conversation histories (in-memory)
   const conversations = new ConversationManager(storage);
 
-  // Initialize credential vault (requires R2 storage)
+  // Initialize credential vault (requires storage backend)
   let vault: CredentialVault | undefined;
   if (storage) {
     const vaultKey = process.env.TAMALEBOT_VAULT_KEY || process.env.TAMALEBOT_API_KEY || apiKey;
@@ -372,9 +364,7 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
           },
         };
 
-        const response = consensus
-          ? await consensus.run(text, history, loopConfig)
-          : await runAgentLoop(text, history, loopConfig);
+        const response = await runAgentLoop(text, history, loopConfig);
 
         // Persist conversation to R2
         conversations.markDirty(conversationKey);
@@ -391,7 +381,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
             cacheCreation: response.totalCacheCreationTokens,
             cacheRead: response.totalCacheReadTokens,
             ...(routeInfo ? { router: routeInfo } : {}),
-            ...(consensus ? { consensus: true } : {}),
           },
         });
       } catch (err) {
@@ -695,7 +684,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
-      consensus,
     });
     await telegram.connect();
     console.log("[tamalebot-agent] Telegram integration started");
@@ -710,7 +698,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
-      consensus,
     });
     await discord.connect();
     console.log("[tamalebot-agent] Discord integration started");
@@ -729,7 +716,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
-      consensus,
     });
     await whatsappIntegration.connect();
     console.log("[tamalebot-agent] WhatsApp integration started");
@@ -746,7 +732,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
-      consensus,
     });
     await slack.connect();
     console.log("[tamalebot-agent] Slack integration started");
@@ -770,7 +755,6 @@ async function startHttpServer(llm: LLMClient, toolContext: ToolContext, modelRo
       llm,
       toolContext,
       router: modelRouter,
-      consensus,
       allowedSenders: process.env.EMAIL_ALLOWED_SENDERS
         ? process.env.EMAIL_ALLOWED_SENDERS.split(",").map(s => s.trim().toLowerCase()).filter(Boolean)
         : undefined,
@@ -948,20 +932,6 @@ async function main(): Promise<void> {
     ownerToken: ownerToken || undefined,
   };
 
-  // Google Workspace tools (optional — requires OAuth credentials)
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
-  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const googleRefreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-  if (googleClientId && googleClientSecret && googleRefreshToken) {
-    const { GoogleAuth } = await import("./google-auth.js");
-    toolContext.googleAuth = new GoogleAuth({
-      clientId: googleClientId,
-      clientSecret: googleClientSecret,
-      refreshToken: googleRefreshToken,
-    });
-    console.log("[tamalebot-agent] Google Workspace tools enabled");
-  }
-
   // Model Router (optional — reduces cost by routing simple messages to cheap model)
   const routerModel = process.env.TAMALEBOT_ROUTER_MODEL;
   let modelRouter: import("./model-router.js").ModelRouter | undefined;
@@ -975,14 +945,6 @@ async function main(): Promise<void> {
       systemPrompt: await buildSystemPrompt(),
     });
     console.log(`[tamalebot-agent] Model router enabled: ${routerModel} (cheap) / ${llm.getModel()} (primary)`);
-  }
-
-  // Consensus mode (optional — multi-perspective debate for better answers)
-  let consensus: import("./consensus.js").ConsensusOrchestrator | undefined;
-  if (consensusEnabled) {
-    const { ConsensusOrchestrator } = await import("./consensus.js");
-    consensus = new ConsensusOrchestrator({ llm, agentCount: consensusAgents });
-    console.log(`[tamalebot-agent] Consensus mode enabled: ${consensusAgents} perspectives`);
   }
 
   console.log(`[tamalebot-agent] Agent "${agentName}" (${agentId}) starting`);
@@ -999,7 +961,7 @@ async function main(): Promise<void> {
   });
 
   if (mode === "http") {
-    await startHttpServer(llm, toolContext, modelRouter, consensus);
+    await startHttpServer(llm, toolContext, modelRouter);
   } else {
     await startRepl(llm, toolContext);
   }

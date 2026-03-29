@@ -12,6 +12,8 @@
  * so users can verify exactly what runs between their agent and the world.
  */
 
+import { resolve, normalize, dirname, basename } from "node:path";
+import { realpathSync } from "node:fs";
 import { z } from "zod";
 
 export interface PolicyDecision {
@@ -121,25 +123,59 @@ export class PolicyEngine {
     return compiled;
   }
 
-  private expandHome(path: string): string {
+  private expandHome(p: string): string {
     const home = process.env.HOME || process.env.USERPROFILE || "~";
-    return path.replace(/^~/, home);
+    return p.replace(/^~/, home);
+  }
+
+  /**
+   * Normalize and resolve a path for security comparison.
+   * Uses path.resolve + path.normalize to canonicalize, then attempts
+   * realpathSync to follow symlinks (falls back to normalized path if
+   * the file doesn't exist yet).
+   */
+  private normalizePath(p: string): string {
+    const hadTrailingSlash = p.endsWith("/");
+    const expanded = this.expandHome(p);
+    const resolved = resolve(normalize(expanded));
+    try {
+      const real = realpathSync(resolved);
+      return hadTrailingSlash ? real + "/" : real;
+    } catch {
+      // File may not exist yet — try resolving the parent directory
+      // so symlinked parents (e.g. /etc → /private/etc on macOS) are caught
+      try {
+        const parentReal = realpathSync(dirname(resolved));
+        const result = resolve(parentReal, basename(resolved));
+        return hadTrailingSlash ? result + "/" : result;
+      } catch {
+        return hadTrailingSlash ? resolved + "/" : resolved;
+      }
+    }
   }
 
   checkFileRead(path: string): PolicyDecision {
-    const expanded = this.expandHome(path);
+    const normalized = this.normalizePath(path);
 
     for (const blocked of this.config.blockedReadPaths) {
-      const blockedExpanded = this.expandHome(blocked);
+      const blockedNorm = this.normalizePath(blocked);
 
-      if (expanded === blockedExpanded) {
+      if (normalized === blockedNorm) {
         return {
           allowed: false,
           reason: `Read access to ${path} is blocked (sensitive file)`,
         };
       }
 
-      if (blockedExpanded.endsWith("/") && expanded.startsWith(blockedExpanded)) {
+      if (blockedNorm.endsWith("/") && normalized.startsWith(blockedNorm)) {
+        return {
+          allowed: false,
+          reason: `Read access to ${path} is blocked (sensitive directory)`,
+        };
+      }
+
+      // Also match if blocked path is a directory prefix without trailing slash
+      if (!blockedNorm.endsWith("/") && normalized.startsWith(blockedNorm + "/")) {
         return {
           allowed: false,
           reason: `Read access to ${path} is blocked (sensitive directory)`,
@@ -151,10 +187,11 @@ export class PolicyEngine {
   }
 
   checkFileWrite(path: string): PolicyDecision {
-    const expanded = this.expandHome(path);
+    const normalized = this.normalizePath(path);
 
     for (const blocked of this.config.blockedWritePaths) {
-      if (expanded.startsWith(blocked)) {
+      const blockedNorm = this.normalizePath(blocked);
+      if (normalized === blockedNorm || normalized.startsWith(blockedNorm + "/") || (blockedNorm.endsWith("/") && normalized.startsWith(blockedNorm))) {
         return {
           allowed: false,
           reason: `Write to ${path} is blocked (system directory)`,

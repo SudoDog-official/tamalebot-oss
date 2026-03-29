@@ -29,7 +29,6 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
-import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
 import { BoundedConversationMap } from "./conversation-map.js";
 
@@ -38,7 +37,6 @@ interface DiscordConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
-  consensus?: ConsensusOrchestrator;
   allowedGuildIds?: string[];
 }
 
@@ -49,7 +47,6 @@ export class DiscordIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private consensus?: ConsensusOrchestrator;
   private allowedGuildIds: Set<string> | null;
   private conversations = new BoundedConversationMap<string>();
   private connected = false;
@@ -59,7 +56,6 @@ export class DiscordIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
-    this.consensus = config.consensus;
     this.allowedGuildIds = config.allowedGuildIds
       ? new Set(config.allowedGuildIds)
       : null;
@@ -176,9 +172,7 @@ export class DiscordIntegration implements Integration {
         },
       };
 
-      const response = this.consensus
-        ? await this.consensus.run(text, history, loopConfig)
-        : await runAgentLoop(text, history, loopConfig);
+      const response = await runAgentLoop(text, history, loopConfig);
 
       // Send response (chunked for Discord's 2000 char limit)
       const responseText = response.text || "(No response)";

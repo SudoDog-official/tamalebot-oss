@@ -28,14 +28,14 @@ export async function runCommand(
   const policy = new PolicyEngine(config?.policy ?? DEFAULT_POLICY);
   const audit = new AuditTrail(logDir, agentId);
 
-  const command = commandArgs.join(" ");
-
-  if (!command) {
+  if (commandArgs.length === 0) {
     console.log(chalk.red("Error: No command specified."));
     console.log(chalk.dim("Usage: tamalebot run <command>"));
     console.log(chalk.dim("Example: tamalebot run python my_agent.py"));
     process.exit(1);
   }
+
+  const command = commandArgs.join(" ");
 
   // Pre-execution security check
   const decision = policy.evaluate("command", command);
@@ -63,8 +63,8 @@ export async function runCommand(
   console.log(chalk.dim(`[tamalebot] Policy: ${options.policy}`));
   console.log(chalk.dim(`[tamalebot] Audit: ${logDir}/${agentId}.audit.jsonl\n`));
 
-  const child = spawn(command, {
-    shell: true,
+  const [cmd, ...args] = commandArgs;
+  const child = spawn(cmd, args, {
     stdio: "inherit",
     env: {
       ...process.env,

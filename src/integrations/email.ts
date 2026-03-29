@@ -24,7 +24,6 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
-import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
 import { BoundedConversationMap } from "./conversation-map.js";
 
@@ -40,7 +39,6 @@ interface EmailConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
-  consensus?: ConsensusOrchestrator;
   allowedSenders?: string[];
 }
 
@@ -52,7 +50,6 @@ export class EmailIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private consensus?: ConsensusOrchestrator;
   private allowedSenders: Set<string> | null;
   private conversations = new BoundedConversationMap<string>();
   private connected = false;
@@ -63,7 +60,6 @@ export class EmailIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
-    this.consensus = config.consensus;
     this.allowedSenders = config.allowedSenders
       ? new Set(config.allowedSenders.map((s) => s.toLowerCase()))
       : null;
@@ -229,9 +225,7 @@ export class EmailIntegration implements Integration {
         },
       };
 
-      const response = this.consensus
-        ? await this.consensus.run(body, history, loopConfig)
-        : await runAgentLoop(body, history, loopConfig);
+      const response = await runAgentLoop(body, history, loopConfig);
 
       let responseText = response.text || "(No response)";
       if (response.toolCallCount > 0) {

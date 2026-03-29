@@ -11,7 +11,7 @@
  * Phase 1 tools: shell, file_read, file_write, web_browse
  */
 
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { readFile, writeFile, mkdir, unlink, chmod } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -20,8 +20,6 @@ import type { PolicyEngine, PolicyDecision } from "../security/policy-engine.js"
 import type { AuditTrail } from "../security/audit-trail.js";
 import type { CredentialVault } from "../security/vault.js";
 import type { StorageBackend } from "../storage/index.js";
-import type { GoogleAuth } from "./google-auth.js";
-import { GOOGLE_TOOL_SCHEMAS, executeGoogleTool } from "./google-tools.js";
 
 export interface ToolResult {
   output: string;
@@ -48,8 +46,6 @@ export interface ToolContext {
   teamStorageEnabled?: boolean;
   // Owner token for authenticated Worker API calls
   ownerToken?: string;
-  // Google Workspace integration
-  googleAuth?: GoogleAuth;
 }
 
 /**
@@ -427,10 +423,6 @@ export function getToolSchemas(ctx: ToolContext): Tool[] {
   if (ctx.teamStorageEnabled) {
     tools.push(TEAM_STORAGE_SCHEMA);
   }
-  if (ctx.googleAuth) {
-    tools.push(...GOOGLE_TOOL_SCHEMAS);
-  }
-
   return tools;
 }
 
@@ -467,18 +459,6 @@ export async function executeTool(
       return executeTeamStorage(input, ctx);
     case "list_agents":
       return executeListAgents(input, ctx);
-    case "google_gmail_search":
-    case "google_gmail_read":
-    case "google_gmail_send":
-    case "google_drive_list":
-    case "google_drive_read":
-    case "google_drive_upload":
-    case "google_docs_read":
-    case "google_sheets_read":
-    case "google_sheets_append":
-    case "google_calendar_list":
-    case "google_calendar_create":
-      return executeGoogleTool(toolName, input, ctx);
     default:
       return { output: `Unknown tool: ${toolName}`, isError: true };
   }
@@ -909,9 +889,20 @@ async function executeSSHExec(
   try {
     await writeFile(tmpKeyPath, privateKey, { mode: 0o600 });
 
+    const sshArgs = [
+      "-i", tmpKeyPath,
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "UserKnownHostsFile=/dev/null",
+      "-o", "BatchMode=yes",
+      "-p", String(port),
+      `${user}@${host}`,
+      command,
+    ];
+
     return await new Promise<ToolResult>((resolve) => {
-      exec(
-        `ssh -i ${tmpKeyPath} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p ${port} ${user}@${host} ${JSON.stringify(command)}`,
+      execFile(
+        "ssh",
+        sshArgs,
         {
           timeout: timeoutMs,
           maxBuffer: 1024 * 1024,
@@ -943,17 +934,34 @@ async function executeSSHExec(
  * Splits on whitespace, rejects any token containing shell metacharacters,
  * and re-joins with spaces. This blocks `;`, `|`, `&`, `$`, backticks, etc.
  */
+/** Safe git flags that are explicitly allowed. */
+const ALLOWED_GIT_FLAGS = new Set([
+  "--oneline", "--all", "--stat", "--no-pager", "--no-edit",
+  "--force", "--tags", "--prune", "--depth", "--shallow-since",
+  "--branch", "--single-branch", "--recurse-submodules",
+  "--no-verify", "--allow-empty", "--amend", "--rebase",
+  "--ff-only", "--no-ff", "--squash", "--abort", "--continue",
+  "-n", "-v", "-q", "-f", "-u", "-b", "-m", "-a", "-p",
+]);
+
 function sanitizeGitArgs(raw: string): string {
   const tokens = raw.trim().split(/\s+/);
   const safe: string[] = [];
   for (const token of tokens) {
-    // Allow flags (--flag, -f), alphanumeric, dots, slashes, colons, equals, tildes, percent (for git format strings)
-    if (/^[a-zA-Z0-9_./:=@~^%-]+$/.test(token)) {
-      safe.push(token);
-    } else {
-      // Reject tokens with shell metacharacters
+    // Reject tokens with shell metacharacters
+    if (!/^[a-zA-Z0-9_./:=@~^%-]+$/.test(token)) {
       throw new Error(`Unsafe character in git args: ${JSON.stringify(token)}`);
     }
+    // Flags must be explicitly allowed to prevent option injection (e.g. --upload-pack, -c)
+    if (token.startsWith("-")) {
+      const flag = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+      // Allow numeric flags like -10, -20 (git log -N)
+      const isNumericFlag = /^-\d+$/.test(flag);
+      if (!isNumericFlag && !ALLOWED_GIT_FLAGS.has(flag)) {
+        throw new Error(`Disallowed git flag: ${JSON.stringify(token)}`);
+      }
+    }
+    safe.push(token);
   }
   return safe.join(" ");
 }

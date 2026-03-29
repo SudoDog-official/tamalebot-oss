@@ -23,7 +23,6 @@ import type { LLMClient } from "../agent/llm-client.js";
 import { runAgentLoop } from "../agent/agent-loop.js";
 import type { ToolContext } from "../agent/tools.js";
 import type { ModelRouter } from "../agent/model-router.js";
-import type { ConsensusOrchestrator } from "../agent/consensus.js";
 import type { Integration } from "./index.js";
 import { BoundedConversationMap } from "./conversation-map.js";
 
@@ -46,7 +45,6 @@ interface SlackConfig {
   llm: LLMClient;
   toolContext: ToolContext;
   router?: ModelRouter;
-  consensus?: ConsensusOrchestrator;
   allowedChannelIds?: string[];
 }
 
@@ -56,7 +54,6 @@ export class SlackIntegration implements Integration {
   private llm: LLMClient;
   private toolContext: ToolContext;
   private router?: ModelRouter;
-  private consensus?: ConsensusOrchestrator;
   private allowedChannelIds: Set<string> | null;
   private connected = false;
   private botUserId: string | null = null;
@@ -66,7 +63,6 @@ export class SlackIntegration implements Integration {
     this.llm = config.llm;
     this.toolContext = config.toolContext;
     this.router = config.router;
-    this.consensus = config.consensus;
     this.allowedChannelIds = config.allowedChannelIds
       ? new Set(config.allowedChannelIds)
       : null;
@@ -184,9 +180,7 @@ export class SlackIntegration implements Integration {
         },
       };
 
-      const response = this.consensus
-        ? await this.consensus.run(text, history, loopConfig)
-        : await runAgentLoop(text, history, loopConfig);
+      const response = await runAgentLoop(text, history, loopConfig);
 
       // Send response (split into chunks if too long)
       const responseText = response.text || "(No response)";
