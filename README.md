@@ -1,8 +1,17 @@
-# TamaleBot
+<p align="center">
+  <img src="tamaleicon.png" alt="TamaleBot" width="120" />
+</p>
 
-Open-source AI agent runtime. Every tool call checked. Every action logged. Every agent isolated.
+<h1 align="center">TamaleBot</h1>
 
-Deploy autonomous AI agents that can run shell commands, read/write files, browse the web, and connect to Telegram, Discord, WhatsApp, Slack, and email — all with security policy enforcement, audit trails, and encrypted credential storage.
+<p align="center">
+  Open-source AI agent runtime.<br/>
+  Every tool call checked. Every action logged. Every agent isolated.
+</p>
+
+---
+
+Deploy autonomous AI agents that can run shell commands, read/write files, browse the web, and connect to Telegram, Discord, WhatsApp, Slack, and email — with security policy enforcement, audit trails, and encrypted credential storage.
 
 ## Quickstart
 
@@ -169,9 +178,9 @@ npm run dev       # Run in development mode
 
 Requires Node.js >= 22.
 
-## Cloud Hosting
+## Managed Hosting
 
-Don't want to self-host? [tamalebot.com](https://tamalebot.com) runs your agents on Cloudflare's global network with a dashboard, one-click deploy, scheduled tasks, and MCP integration — $5/mo base.
+Don't want to self-host? [tamalebot.com](https://tamalebot.com) offers managed agent hosting with a dashboard, one-click deploy, scheduled tasks, and MCP integration.
 
 ## License
 
